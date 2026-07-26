@@ -1284,14 +1284,19 @@ def cmd_next(args) -> int:
 
 
 def cmd_auto(args) -> int:
-    """現在の弾が使えるならそのまま、ダメなら順送りで次弾を装填する（起動前フック用）。"""
+    """起動前に、必要なときだけアカウントを切り替える。
+
+    シェルのラッパーから毎回呼ばれるので、既定ではネットワークを叩かない
+    （--no-probe）。残量の追跡は常駐監視に任せ、ここはローカルの状態だけを見る。
+    起動を遅らせないことと、CLI 本体に干渉しないことを優先する。
+    """
+    prov = getattr(args, "provider", "claude")
     clear_expired_cooldowns()
-    accs = accounts()
-    if not accs:
-        return 0  # 未設定なら何もしない（通常の claude 起動を邪魔しない）
-    cur = get_current("claude")
+    if not accounts_of(prov):
+        return 0  # 未設定なら何もしない（通常の起動を邪魔しない）
+    cur = get_current(prov)
     if cur and cooldown_left(cur) == 0:
-        p = probe(cur) if not args.no_probe else None
+        p = probe(cur) if (not args.no_probe and prov == "claude") else None
         ok, why = is_usable(cur, p)
         if ok:
             if args.verbose:
@@ -1300,7 +1305,7 @@ def cmd_auto(args) -> int:
                       f"[magazine] {cur}: 5h {pct if pct is not None else '?'}% — そのまま"))
             return 0
         print(T(f"[magazine] {cur} is out ({why})", f"[magazine] {cur} 上限到達 ({why})"))
-    rc = cmd_next(argparse.Namespace(no_probe=args.no_probe))
+    rc = cmd_next(argparse.Namespace(no_probe=args.no_probe, provider=prov))
     if rc == 2 and not getattr(args, "strict", False):
         # 起動前の判定はまだ「上限確定」ではない。残りを使い切らせるため現弾のまま起動する。
         print(T("[magazine] No spare account. Starting on the current one (a real limit will be detected).",
@@ -1646,6 +1651,14 @@ def spawn_claude(argv: list, sid: str, on_hit, provider: str = "claude") -> tupl
 
 
 def cmd_run(args) -> int:
+    """[実験的] claude を擬似端末で包む。
+
+    擬似端末で TUI を包むと、起動時の端末能力ネゴシエーションやキーボード
+    プロトコルの受け渡しに影響し、キー入力や改行の扱いが壊れることがある。
+    通常は常駐監視（mag watch）が Keychain を書き換えるだけで、走っている
+    セッションを止めずに切り替えられるので、こちらを使う必要はない。
+    上限後の自動再開がどうしても欲しい場合のみ。
+    """
     cfg = config()
     passthrough = list(args.claude_args or [])
     if passthrough and passthrough[0] == "--":
@@ -2395,7 +2408,8 @@ Registering:
                    help=T("use codex to register a ChatGPT (codex CLI) account","codex を指定すると ChatGPT (codex CLI) 側に登録"))
     a.set_defaults(func=cmd_add)
 
-    a = sub.add_parser("crun", help=T("run codex with auto-switch on limits","codex を監視付きで起動（上限で自動切替）"))
+    a = sub.add_parser("crun", help=T("[experimental] wrap codex in a pty to auto-resume after a limit",
+                                  "[実験的] codex を擬似端末で包み上限後に自動再開"))
     a.add_argument("codex_args", nargs=argparse.REMAINDER)
     a.set_defaults(func=cmd_crun)
 
@@ -2421,14 +2435,19 @@ Registering:
     a.set_defaults(func=cmd_next)
 
     a = sub.add_parser("auto", help=T("switch only if needed (pre-launch hook)","必要なら切り替え（起動前フック）"))
-    a.add_argument("--no-probe", action="store_true"); a.add_argument("-v", "--verbose", action="store_true")
+    a.add_argument("--no-probe", action="store_true",
+                   help=T("decide from local state only, no network",
+                          "ネットワークを使わずローカル状態だけで判断"))
+    a.add_argument("--provider", choices=["claude", "codex"], default="claude")
+    a.add_argument("-v", "--verbose", action="store_true")
     a.set_defaults(func=cmd_auto)
 
     a = sub.add_parser("hit", help=T("record a limit hit and move on","上限到達を記録して次へ"))
     a.add_argument("--kind", choices=["five_hour", "seven_day"]); a.add_argument("--slug")
     a.set_defaults(func=cmd_hit)
 
-    a = sub.add_parser("run", help=T("run claude with auto-switch and resume","claude を監視付きで起動（上限で自動切替・再開）"))
+    a = sub.add_parser("run", help=T("[experimental] wrap claude in a pty to auto-resume after a limit",
+                                 "[実験的] claude を擬似端末で包み上限後に自動再開"))
     a.add_argument("claude_args", nargs=argparse.REMAINDER)
     a.set_defaults(func=cmd_run, initial_prompt=None)
 

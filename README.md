@@ -79,18 +79,31 @@ $ mag stalled
 $ mag resume 58f72cbd     # swaps in a live account, resumes, continues the workflow
 ```
 
-### 2. Swapping does not restart your session (Claude Code)
+### 2. Swapping does not restart your session, and does not touch the CLI
 
-Claude Code re-reads the keychain on each request, so `magazine` rewrites only the
-`claudeAiOauth` slot and every session already running — including background workflows —
+Claude Code re-reads the keychain on each request. `magazine` rewrites only the
+`claudeAiOauth` slot, and every session already running — including background workflows —
 continues on the new account. Nothing is killed, nothing is resumed, nothing is lost.
 
-`mag watch` runs this as a daemon: when the active account crosses your threshold, the clip
-advances silently and a notification tells you it happened.
+That is the whole mechanism, and it is deliberately **outside** the CLI:
 
-> Codex is different. `~/.codex/auth.json` is not re-read mid-process, so Codex swaps take
-> effect from the next `codex` start. `mag crun` handles that by detecting the limit,
-> chambering the next account, and resuming with `codex resume --last`.
+- `mag watch` is a daemon. It never attaches to your terminal or to any `claude` process.
+- Usage comes from the **statusLine hook** — a documented extension point — so reading it
+  costs no extra API calls and requires no scraping.
+- The shell wrapper only runs `mag auto --no-probe` (~0.09s, no network) before handing off
+  to the real binary with `exec`. Your terminal talks to `claude` directly, as it always did.
+
+Nothing sits between your keyboard and the CLI. That matters more than it sounds: wrapping a
+TUI in a pty means brokering terminal capability negotiation and keyboard protocols, and
+getting any of it subtly wrong breaks arrow keys and multi-line input. `magazine` does not
+take that risk on the default path.
+
+> Codex swaps take effect from the next `codex` start, since `~/.codex/auth.json` is read at
+> startup. The daemon still tracks Codex usage (from its session journals) and swaps ahead of
+> the limit, so the next start already has a fresh account.
+
+There are `mag run` / `mag crun` commands that *do* wrap the CLI in a pty to auto-resume after
+a hard limit. They are **experimental and off by default** — for exactly the reason above.
 
 ## Correctness notes
 
@@ -142,9 +155,8 @@ mag next                   # advance the clip
 mag use sub                # chamber a specific one (partial names work)
 mag status                 # per-account detail
 
-# run with automatic swapping
-mag run -- claude          # or just `claude`, with the shell wrapper installed
-mag crun -- codex          # or just `codex`
+# nothing to do — with the daemon running, just use claude / codex normally.
+# the shell wrapper only picks an account before handing off to the real binary.
 
 # recover what a limit interrupted
 mag stalled

@@ -1,34 +1,34 @@
-# claude-magazine: claude を弾倉ラッパー経由で起動する
-# 無効化したいときは `command claude ...` か、この関数ファイルを削除するだけ。
-function claude --description 'claude (magazine auto-reload)'
+# magazine: claude / codex を起動する前に、使えるアカウントを選んでおくだけのラッパー。
+#
+# 方針: CLI 本体には干渉しない。
+#   起動前に「必要なら切り替える」だけを行い、あとは素の claude / codex を exec する。
+#   稼働中の切り替えは常駐監視（mag watch）が Keychain を書き換えて行うので、
+#   端末を横取りする必要はない。TUI を擬似端末で包むと、キーボードプロトコルの
+#   ネゴシエーションや改行の扱いが壊れる。
+#
+# 無効化したいときは `command claude ...` か、このファイルを削除するだけ。
+
+function claude --description 'claude (magazine: pick an account first)'
     set -l mag $HOME/.claude-magazine/mag.py
 
-    # 弾倉が未設定なら何もせず素通し
     if not test -f $HOME/.claude-magazine/accounts.json
         command claude $argv
         return $status
     end
 
-    # 管理系サブコマンドは弾倉ロジックを一切挟まず素通しする。
-    # 特に `claude auth login` はブラウザ認証を伴い、PTY 監視や自動装填が邪魔になる。
+    # 認証・管理系は素通し（claude auth login はブラウザ認証を伴う）
     if contains -- "$argv[1]" auth mcp plugin plugins install update upgrade doctor setup-token agents project gateway ultrareview
         command claude $argv
         return $status
     end
 
-    # 非対話（-p / パイプ / リダイレクト）は PTY 監視をかけず、起動前の自動装填だけ行う
-    if not isatty stdout; or contains -- -p $argv; or contains -- --print $argv
-        python3 $mag auto >/dev/null 2>&1
-        command claude $argv
-        return $status
-    end
-
-    python3 $mag run -- $argv
+    # ネットワークを叩かずローカルの状態だけで判断する（起動を遅らせない）
+    python3 $mag auto --no-probe >/dev/null 2>&1
+    command claude $argv
     return $status
 end
 
-# codex (ChatGPT) 側も同じ弾倉で回す
-function codex --description 'codex (magazine auto-reload)'
+function codex --description 'codex (magazine: pick an account first)'
     set -l mag $HOME/.claude-magazine/mag.py
 
     if not test -f $HOME/.claude-magazine/accounts.json
@@ -36,18 +36,12 @@ function codex --description 'codex (magazine auto-reload)'
         return $status
     end
 
-    # 認証・管理系は素通し（codex login はブラウザ認証を伴う）
     if contains -- "$argv[1]" login logout mcp plugin update doctor completion app sandbox debug
         command codex $argv
         return $status
     end
 
-    # 非対話（exec / パイプ）は監視をかけない
-    if not isatty stdout; or contains -- exec $argv
-        command codex $argv
-        return $status
-    end
-
-    python3 $mag crun -- $argv
+    python3 $mag auto --no-probe --provider codex >/dev/null 2>&1
+    command codex $argv
     return $status
 end
