@@ -1430,6 +1430,33 @@ def set_winsize(fd: int) -> None:
         pass
 
 
+def reset_terminal_modes() -> None:
+    """端末を素の状態へ戻す。
+
+    Claude Code / Codex は起動時にキー入力の拡張報告（kitty keyboard protocol、
+    modifyOtherKeys）や括弧付きペースト、マウス報告、代替画面を有効にする。
+    通常終了なら本人が戻すが、上限検知でこちらが強制終了させると戻されずに残る。
+    残ったままだと矢印キーが生のエスケープ列として見えたり、改行が効かなくなる。
+    後片付けはこちらが引き受ける。
+    """
+    seq = (
+        "\x1b[<u"          # kitty keyboard protocol を戻す
+        "\x1b[>4;m"        # modifyOtherKeys を既定へ
+        "\x1b[?2004l"      # 括弧付きペースト off
+        "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l"   # マウス報告 off
+        "\x1b[?1049l"      # 代替画面から戻る
+        "\x1b[?7h"         # 自動折返し on
+        "\x1b[?25h"        # カーソル表示
+        "\x1b[0m"          # 文字属性リセット
+        "\r"
+    )
+    try:
+        sys.stdout.write(seq)
+        sys.stdout.flush()
+    except (OSError, ValueError):
+        pass
+
+
 def banner(msg: str) -> None:
     """自前の通知を出す。
 
@@ -1459,7 +1486,22 @@ def spawn_claude(argv: list, sid: str, on_hit, provider: str = "claude") -> tupl
         except OSError:
             winsz = None
 
-    pid, master = pty.fork()
+    # 端末を raw にするのは fork より「前」でなければならない。
+    # 子は起動直後に端末へ問い合わせ（キーボードプロトコルや背景色など）を投げ、
+    # その応答を stdin から読む。こちらが行バッファのままだと、応答は改行が来るまで
+    # 取り出せず子側がタイムアウトし、矢印キーが生のエスケープ列として入ったり
+    # 複数行入力が壊れたりする。しかもエコーが有効なので応答が画面に出てしまう。
+    old = None
+    if parent_is_tty:
+        old = mode
+        tty.setraw(sys.stdin.fileno())
+
+    try:
+        pid, master = pty.fork()
+    except OSError:
+        if old:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old)
+        raise
     if pid == 0:
         # ここでの fd 0/1/2 は擬似端末の子側。実端末と同じ設定にしてから起動する。
         try:
@@ -1473,10 +1515,6 @@ def spawn_claude(argv: list, sid: str, on_hit, provider: str = "claude") -> tupl
         os._exit(127)
 
     set_winsize(master)
-    old = None
-    if parent_is_tty:
-        old = mode
-        tty.setraw(sys.stdin.fileno())
 
     def on_winch(signum, frame):
         set_winsize(master)
@@ -1546,6 +1584,10 @@ def spawn_claude(argv: list, sid: str, on_hit, provider: str = "claude") -> tupl
         signal.signal(signal.SIGWINCH, prev_winch)
         if old:
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old)
+        if hit_kind is None and not hit:
+            # 子が自分で終わった／こちらが落ちた場合。子が後片付けを済ませていれば
+            # この列は無害だが、途中で死んでいた場合はこれが最後の砦になる。
+            reset_terminal_modes()
 
     if hit:
         # 子プロセスの TUI がまだ描画している最中にこちらが書き込むと、行が割り込まれて
@@ -1587,9 +1629,7 @@ def spawn_claude(argv: list, sid: str, on_hit, provider: str = "claude") -> tupl
             os.close(master)
         except OSError:
             pass
-        # 端末を素の状態に戻す（代替画面を抜け、属性と折返しを既定へ）
-        sys.stdout.write("\x1b[?1049l\x1b[?25h\x1b[?7h\x1b[0m\r\n")
-        sys.stdout.flush()
+        reset_terminal_modes()
         on_hit(hit_kind)
         return 0, hit_kind, hit_reset
 
