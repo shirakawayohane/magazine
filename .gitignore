@@ -1,0 +1,18 @@
+# 実行時データは絶対にコミットしない（トークンが含まれうる）
+accounts.json
+state.json
+config.json
+live/
+logs/
+*.log
+
+# 認証情報らしきもの全般（保険）
+*credentials*
+*auth.json
+*.pem
+*.key
+
+.DS_Store
+__pycache__/
+*.pyc
+.venv/
