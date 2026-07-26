@@ -2253,77 +2253,88 @@ exec python3 {os.path.join(ROOT, 'mag.py')} statusline
 def main() -> int:
     p = argparse.ArgumentParser(
         prog="mag",
-        description="Claude Code / Codex のサブスクを弾倉のように束ねて、上限で次弾に送る",
-        epilog="""よく使う流れ:
+        description=T("Pool your Claude Code / Codex subscriptions and switch when one runs out",
+                      "Claude Code / Codex のサブスクをまとめ、上限に達したら次に切り替える"),
+        epilog=T("""Common flow:
+  mag limits                     usage for every account
+  mag next                       switch to the next account
+  mag use sub                    switch to a specific one (partial name ok)
+  mag stalled                    find sessions stopped by a limit
+  mag resume <session-id>        resume one (an interrupted workflow continues)
+
+Registering:
+  claude auth login  ->  mag add --label main
+  codex login        ->  mag add --provider codex --label codex-main
+""", """よく使う流れ:
   mag limits                     全アカウントの残量を一覧
-  mag next                       次弾に送る
-  mag use sub                    指定した弾を装填（部分一致可）
+  mag next                       次のアカウントに切り替え
+  mag use sub                    指定アカウントに切り替え（部分一致可）
   mag stalled                    上限で止まったセッションを探す
-  mag resume <session-id>        止まったセッションを再開（workflow は続きから）
+  mag resume <session-id>        再開（中断した workflow は続きから）
 
 登録:
-  claude auth login  →  mag add --label main
-  codex login        →  mag add --provider codex --label codex-main
-""",
+  claude auth login  ->  mag add --label main
+  codex login        ->  mag add --provider codex --label codex-main
+"""),
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--version", action="version", version=f"magazine {VERSION}")
     sub = p.add_subparsers(dest="cmd", required=True, metavar="COMMAND")
 
-    a = sub.add_parser("add", help="今ログイン中のアカウントを弾倉に登録")
+    a = sub.add_parser("add", help=T("register the account you are signed in to now","現在ログイン中のアカウントを登録"))
     a.add_argument("--label"); a.add_argument("--slug")
     a.add_argument("--provider", choices=["claude", "codex"], default="claude",
-                   help="codex を指定すると ChatGPT (codex CLI) 側に登録")
+                   help=T("use codex to register a ChatGPT (codex CLI) account","codex を指定すると ChatGPT (codex CLI) 側に登録"))
     a.set_defaults(func=cmd_add)
 
-    a = sub.add_parser("crun", help="codex を監視付きで起動（上限で自動リロード＆再開）")
+    a = sub.add_parser("crun", help=T("run codex with auto-switch on limits","codex を監視付きで起動（上限で自動切替）"))
     a.add_argument("codex_args", nargs=argparse.REMAINDER)
     a.set_defaults(func=cmd_crun)
 
-    a = sub.add_parser("remove", help="弾倉から外す")
+    a = sub.add_parser("remove", help=T("remove an account","アカウントを削除"))
     a.add_argument("slug"); a.set_defaults(func=cmd_remove)
 
-    a = sub.add_parser("status", aliases=["st"], help="弾倉の状態一覧")
+    a = sub.add_parser("status", aliases=["st"], help=T("per-account detail","アカウントごとの詳細"))
     a.add_argument("--quick", action="store_true", help="API を叩かず cooldown だけ表示")
     a.set_defaults(func=cmd_status)
-    sub.add_parser("list", aliases=["ls"], help="弾倉を一覧（残量は見に行かない）").set_defaults(
+    sub.add_parser("list", aliases=["ls"], help=T("list accounts (no usage lookup)","アカウント一覧（残量は見に行かない）")).set_defaults(
         func=cmd_status, quick=True)
 
-    a = sub.add_parser("limits", aliases=["l"], help="全マガジンの残量を一気に表示")
-    a.add_argument("--json", action="store_true", help="JSON で出力（スクリプト用）")
+    a = sub.add_parser("limits", aliases=["l"], help=T("show usage for every account at once","全アカウントの残量を一覧"))
+    a.add_argument("--json", action="store_true", help=T("output JSON (for scripts)","JSON で出力（スクリプト用）"))
     a.set_defaults(func=cmd_limits)
 
-    a = sub.add_parser("load", aliases=["use"], help="指定アカウントを装填（部分一致可）")
+    a = sub.add_parser("load", aliases=["use"], help=T("switch to an account (partial name ok)","指定アカウントに切り替え（部分一致可）"))
     a.add_argument("slug", metavar="NAME"); a.set_defaults(func=cmd_load)
 
-    a = sub.add_parser("next", help="順送りで次弾を装填")
+    a = sub.add_parser("next", help=T("advance to the next account","次のアカウントに切り替え"))
     a.add_argument("--no-probe", action="store_true")
     a.add_argument("--provider", choices=["claude", "codex"], default="claude")
     a.set_defaults(func=cmd_next)
 
-    a = sub.add_parser("auto", help="必要なら次弾に切替（起動前フック）")
+    a = sub.add_parser("auto", help=T("switch only if needed (pre-launch hook)","必要なら切り替え（起動前フック）"))
     a.add_argument("--no-probe", action="store_true"); a.add_argument("-v", "--verbose", action="store_true")
     a.set_defaults(func=cmd_auto)
 
-    a = sub.add_parser("hit", help="上限ヒットを記録して次弾へ")
+    a = sub.add_parser("hit", help=T("record a limit hit and move on","上限到達を記録して次へ"))
     a.add_argument("--kind", choices=["five_hour", "seven_day"]); a.add_argument("--slug")
     a.set_defaults(func=cmd_hit)
 
-    a = sub.add_parser("run", help="claude を監視付きで起動（上限で自動リロード＆再開）")
+    a = sub.add_parser("run", help=T("run claude with auto-switch and resume","claude を監視付きで起動（上限で自動切替・再開）"))
     a.add_argument("claude_args", nargs=argparse.REMAINDER)
     a.set_defaults(func=cmd_run, initial_prompt=None)
 
-    a = sub.add_parser("watch", help="常駐して無停止ホットスワップ（稼働中セッションを止めない）")
+    a = sub.add_parser("watch", help=T("daemon: switch before limits, without stopping sessions","常駐監視：セッションを止めずに事前切替"))
     a.add_argument("--interval", type=float, default=20.0, help="live 監視の間隔（秒）")
     a.add_argument("--api-interval", type=float, default=300.0, help="usage API の裏取り間隔（秒）")
     a.add_argument("--threshold", type=float, default=None, help="切替する使用率（既定 98%%）")
     a.set_defaults(func=cmd_watch)
 
-    a = sub.add_parser("stalled", help="上限で止まったセッションを一覧")
+    a = sub.add_parser("stalled", help=T("list sessions stopped by a limit","上限で止まったセッションを一覧"))
     a.add_argument("--hours", type=float, default=24.0)
     a.add_argument("--all", action="store_true", help="止まっていないセッションも含める")
     a.set_defaults(func=cmd_stalled)
 
-    a = sub.add_parser("resume", help="止まったセッションを再開（workflow は続きから）")
+    a = sub.add_parser("resume", help=T("resume a stopped session (workflow continues)","止まったセッションを再開（workflow は続きから）"))
     a.add_argument("session", help="セッション ID（先頭一致で可）")
     a.add_argument("--hours", type=float, default=72.0)
     a.add_argument("--dry-run", action="store_true", help="何をするかだけ表示")
@@ -2331,9 +2342,9 @@ def main() -> int:
     a.add_argument("--prompt", help="再開時に送る最初の一言")
     a.set_defaults(func=cmd_resume)
 
-    sub.add_parser("statusline", help="statusLine から呼ばれる").set_defaults(func=cmd_statusline)
-    sub.add_parser("install-statusline", help="statusLine に連携を仕込む").set_defaults(func=cmd_install_statusline)
-    sub.add_parser("doctor", help="設定チェック").set_defaults(func=cmd_doctor)
+    sub.add_parser("statusline", help=T("(internal) called by the statusLine hook","(内部) statusLine から呼ばれる")).set_defaults(func=cmd_statusline)
+    sub.add_parser("install-statusline", help=T("wire up the statusLine hook","statusLine 連携を設定")).set_defaults(func=cmd_install_statusline)
+    sub.add_parser("doctor", help=T("check the installation","インストール状態を確認")).set_defaults(func=cmd_doctor)
 
     args = p.parse_args()
     try:
