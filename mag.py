@@ -813,6 +813,12 @@ def probe(slug: str, quiet: bool = True) -> dict:
         # usage エンドポイント側の絞り。アカウントの可否は判定できない＝不明として扱う。
         res["error"] = T("usage API returned 429 (usage unknown; requests may still work)", "使用量APIが429（残量不明・リクエストは通る場合あり）")
         res["info_unavailable"] = True
+    except (urllib.error.URLError, OSError) as e:
+        # 圏外・スリープ復帰直後など。残量が読めないだけで、アカウントは無事。
+        res["error"] = T("network unreachable", "ネットワーク到達不可")
+        res["info_unavailable"] = True
+        res["offline"] = True
+        _ = e
     except Exception as e:
         res["error"] = str(e)[:80]
         res["info_unavailable"] = True
@@ -1438,15 +1444,38 @@ def banner(msg: str) -> None:
 def spawn_claude(argv: list, sid: str, on_hit, provider: str = "claude") -> tuple[int, str | None, float | None]:
     """claude を PTY で起動。上限を検知したら子を畳んで (exit_code, kind, resets_at) を返す。"""
     cfg = config()
+
+    # pty.fork() で作られる子側の端末は「既定値」で始まり、こちらの端末設定を
+    # 引き継がない。そのままだと子から見た端末の性質が実際の端末と食い違い、
+    #   - Ctrl-C が信号にならず ^C という文字として入ってしまう（ISIG 相当の差）
+    #   - 改行の扱いがずれて2行目以降の表示が崩れる（ICRNL/ONLCR 相当の差）
+    # といった不具合が出る。元の設定とウィンドウサイズを子側へ複製しておく。
+    parent_is_tty = sys.stdin.isatty()
+    mode = termios.tcgetattr(sys.stdin) if parent_is_tty else None
+    winsz = None
+    if parent_is_tty:
+        try:
+            winsz = fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, b"\x00" * 8)
+        except OSError:
+            winsz = None
+
     pid, master = pty.fork()
     if pid == 0:
+        # ここでの fd 0/1/2 は擬似端末の子側。実端末と同じ設定にしてから起動する。
+        try:
+            if mode is not None:
+                termios.tcsetattr(0, termios.TCSANOW, mode)
+            if winsz is not None:
+                fcntl.ioctl(0, termios.TIOCSWINSZ, winsz)
+        except (OSError, termios.error):
+            pass
         os.execvp(argv[0], argv)
         os._exit(127)
 
     set_winsize(master)
     old = None
-    if sys.stdin.isatty():
-        old = termios.tcgetattr(sys.stdin)
+    if parent_is_tty:
+        old = mode
         tty.setraw(sys.stdin.fileno())
 
     def on_winch(signum, frame):
