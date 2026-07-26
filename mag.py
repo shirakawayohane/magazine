@@ -1529,7 +1529,9 @@ def spawn_claude(argv: list, sid: str, on_hit, provider: str = "claude") -> tupl
             if provider == "claude" and now() - last_live > cfg["live_poll_interval"]:
                 last_live = now()
                 lv = read_live(sid)
-                if lv and now() - lv.get("ts", 0) < 60:
+                if (lv and now() - lv.get("ts", 0) < 60
+                        and lv.get("slug") == get_current("claude")
+                        and switch_grace_ok(lv.get("ts", 0))):
                     for k, th in (("five_hour", cfg["five_hour_threshold"]),
                                   ("seven_day", cfg["seven_day_threshold"])):
                         pct = (lv.get(k) or {}).get("pct")
@@ -1934,6 +1936,38 @@ def notify(title: str, msg: str) -> None:
         pass
 
 
+def switch_grace_ok(ts: float, provider: str = "claude", grace: float = 45.0) -> bool:
+    """切り替え直後の測定値を信用してよいか。
+
+    Claude Code は直近のAPI応答に付いてきた rate_limits を保持しているので、
+    アカウントを入れ替えた直後のしばらくは「前のアカウントの数値」を報告し続ける。
+    それを新しいアカウントの数値として扱うと、切り替えた先を即座に上限扱いして
+    しまう（実際にそれで無限に切り替わる不具合を出した）。
+    """
+    last = (state().get("last_switch_by") or {}).get(provider) or 0
+    return ts >= last + grace
+
+
+def set_cooldown_verified(slug: str, kind: str, resets_at=None, source: str = "") -> bool:
+    """間接的なシグナルで上限扱いにする前に、本人の実測で裏を取る。
+
+    statusLine 由来の数値は「誰の数値か」を取り違えうる。裏取りせずに
+    cooldown を張ると、まだ余裕のあるアカウントを外してしまう。
+    """
+    p = probe(slug)
+    if p.get("ok"):
+        blk = p.get(kind) or {}
+        pct = blk.get("pct")
+        th = config().get(f"{kind}_threshold", 99.5)
+        if pct is not None and pct < th - 5:
+            log(f"cooldown 見送り: {slug} は実測 {pct:.0f}%（{source} の申告と不一致）")
+            return False
+        if blk.get("resets_at"):
+            resets_at = blk["resets_at"]
+    set_cooldown(slug, kind, resets_at)
+    return True
+
+
 def live_worst(max_age: float = 120.0) -> dict | None:
     """稼働中セッションの statusLine から届いた使用率のうち、最も逼迫したものを返す。"""
     if not os.path.isdir(LIVE_DIR):
@@ -1948,6 +1982,8 @@ def live_worst(max_age: float = 120.0) -> dict | None:
             continue
         if cur and d.get("slug") and d["slug"] != cur:
             continue
+        if not switch_grace_ok(d.get("ts", 0)):
+            continue      # 切替直後は前のアカウントの数値が残っている
         for k in ("five_hour", "seven_day"):
             pct = (d.get(k) or {}).get("pct")
             if pct is None:
@@ -2038,7 +2074,11 @@ def hotswap(kind: str, reason: str, resets_at=None) -> bool:
     """稼働中のプロセスには触れず、Keychain の弾だけを入れ替える。"""
     cur = get_current("claude")
     if cur:
-        set_cooldown(cur, kind, resets_at if isinstance(resets_at, (int, float)) else None)
+        # 申告されただけでは外さない。本人の実測と突き合わせてから上限扱いにする。
+        if not set_cooldown_verified(cur, kind,
+                                     resets_at if isinstance(resets_at, (int, float)) else None,
+                                     source=reason):
+            return False
     slug, report = next_slug(cur, probe_all=True)
     if not slug:
         bslug, when = soonest_reset()
