@@ -132,6 +132,24 @@ HIT_EXCLUDE = re.compile(
 )
 HIT_RE = [(re.compile(p, re.I), kind) for p, kind in HIT_PATTERNS]
 
+# 組織の支出上限で止められた場合。レート制限と違い時間では戻らず、管理者が枠を
+# 上げるまで解けない。ローカルの --max-budget-usd（"Budget limit reached ($1.20 of
+# $5.00 maximum)"）とは別物なので、そちらと取り違えないよう具体的に書く。
+SPEND_BLOCK_PATTERNS = [
+    r"hit your org(?:anization)?'?s?\s+monthly spend limit",
+    r"monthly spend limit",
+    # Codex は識別子そのままで出ることがある（workspace_member_usage_limit_reached 等）
+    r"workspace[ _](?:owner|member)[ _](?:usage[ _]limit[ _]reached|credits[ _]depleted)",
+    r"spend[ _]control[ _]reached",
+    r"organization'?s? (?:usage|spend) limit",
+    r"/usage-credits to ask your admin",
+    r"credit balance too low",
+    r"(?:組織|ワークスペース)の(?:月次)?(?:支出|利用)上限",
+]
+SPEND_BLOCK_RE = [re.compile(p, re.I) for p in SPEND_BLOCK_PATTERNS]
+# ローカルの予算指定はアカウントの問題ではないので、支出ブロック判定から外す
+LOCAL_BUDGET_RE = re.compile(r"budget limit reached \(\$", re.I)
+
 # Codex (ChatGPT) 側の上限メッセージ。バイナリ内の実文言に合わせてある。
 #   "You've hit your usage limit." / "You've hit your usage limit for <window>"
 CODEX_HIT_PATTERNS = [
@@ -764,7 +782,7 @@ def set_cooldown(slug: str, kind: str | None, resets_at: float | None) -> None:
     cfg = config()
     kind = kind or "five_hour"
     if not resets_at:
-        span = cfg[f"fallback_cooldown_{kind}"]
+        span = cfg.get(f"fallback_cooldown_{kind}") or cfg["fallback_cooldown_five_hour"]
         resets_at = now() + span
     s = state()
     s.setdefault("cooldowns", {})[slug] = {
@@ -896,7 +914,9 @@ def next_slug(after: str | None, probe_all: bool = True,
         cand = slugs[(start + i) % len(slugs)]
         if cooldown_left(cand) > 0:
             cd = state()["cooldowns"][cand]
-            report.append((cand, f"cooldown → {fmt_when(cd['until'])}"))
+            report.append((cand, T("org spend limit (admin action needed)", "組織の支出上限（管理者対応が必要）")
+                                  if cd.get("kind") == "spend"
+                                  else f"cooldown → {fmt_when(cd['until'])}"))
             continue
         # Codex には残量 API が無い（Cloudflare で 403）ので実ヒット検知に委ねる
         p = probe(cand) if (probe_all and provider == "claude") else None
@@ -1093,8 +1113,12 @@ def _print_magazine(accs: list, prov: str, args) -> int:
         left = cooldown_left(slug)
         if left > 0:
             cd = state()["cooldowns"][slug]
-            print(T(f"    ⏳ limited ({cd.get('kind')}) → {fmt_when(cd['until'])}",
-                  f"    ⏳ 上限到達 ({cd.get('kind')}) → {fmt_when(cd['until'])}"))
+            if cd.get("kind") == "spend":
+                print(T("    ⛔ org spend limit — needs an admin to raise it",
+                        "    ⛔ 組織の支出上限 — 管理者が枠を上げるまで戻りません"))
+            else:
+                print(T(f"    ⏳ limited ({cd.get('kind')}) → {fmt_when(cd['until'])}",
+                        f"    ⏳ 上限到達 ({cd.get('kind')}) → {fmt_when(cd['until'])}"))
         w = (state().get("warm") or {}).get(slug)
         if w and w.get("for_since") == state().get("last_switch", 0):
             print(T(f"    🔥 pre-checked: {'OK' if w.get('ok') else 'FAILED: ' + w.get('msg','')[:40]}",
@@ -1213,8 +1237,12 @@ def cmd_limits(args) -> int:
             head = f" {mark} {name}"
             if r["cooldown"] > 0:
                 cd = state()["cooldowns"][r["slug"]]
-                head += T(f"  \033[31m⏳ limited → {fmt_when(cd['until'])}\033[0m",
-                          f"  \033[31m⏳ 上限到達 → {fmt_when(cd['until'])}\033[0m")
+                if cd.get("kind") == "spend":
+                    head += T("  \033[31m⛔ org spend limit — needs an admin to raise it\033[0m",
+                              "  \033[31m⛔ 組織の支出上限 — 管理者が枠を上げるまで戻りません\033[0m")
+                else:
+                    head += T(f"  \033[31m⏳ limited → {fmt_when(cd['until'])}\033[0m",
+                              f"  \033[31m⏳ 上限到達 → {fmt_when(cd['until'])}\033[0m")
             print(head)
             if r.get("note") and not r["windows"]:
                 print(f"      \033[2m{r['note']}\033[0m")
@@ -1414,8 +1442,24 @@ def parse_reset_time(text: str) -> float | None:
     return t.timestamp()
 
 
+def month_end() -> float:
+    """今月末（ローカル時刻）。組織の月次支出上限はここで戻る見込み。"""
+    d = datetime.now()
+    nxt = d.replace(day=28) + timedelta(days=4)
+    first = nxt.replace(day=1, hour=0, minute=5, second=0, microsecond=0)
+    return first.timestamp()
+
+
 def detect_hit(text: str, provider: str = "claude") -> tuple[bool, str | None, float | None]:
     rules = CODEX_HIT_RE if provider == "codex" else HIT_RE
+    # 支出ブロックを先に見る。文面が「limit」を含むため、後段の除外に
+    # 巻き込まれて見落とされていた。
+    for line in text.splitlines():
+        if LOCAL_BUDGET_RE.search(line):
+            continue      # ローカルの --max-budget-usd はアカウントの問題ではない
+        for rx in SPEND_BLOCK_RE:
+            if rx.search(line):
+                return True, "spend", month_end()
     for line in text.splitlines():
         if HIT_EXCLUDE.search(line):
             continue
@@ -2007,6 +2051,12 @@ def set_cooldown_verified(slug: str, kind: str, resets_at=None, source: str = ""
     statusLine 由来の数値は「誰の数値か」を取り違えうる。裏取りせずに
     cooldown を張ると、まだ余裕のあるアカウントを外してしまう。
     """
+    if kind == "spend":
+        # 組織の支出上限。残量には表れない（枠が余っていても止められる）ので
+        # 使用率との突き合わせでは検証できない。申告をそのまま信じる。
+        set_cooldown(slug, kind, resets_at or month_end())
+        log(f"spend block: {slug} は組織の支出上限で停止（管理者の対応が必要）")
+        return True
     p = probe(slug)
     if p.get("ok"):
         blk = p.get(kind) or {}
