@@ -34,7 +34,8 @@ actually differs — and where it does not.
 | **Both, from one CLI**            |  **✅**  |   —   |    —     |       —       |      —       |       GUI menu bar        |       —         |
 | **Resumes interrupted workflows** |  **✅**  |   —   |    —     |       —       |      —       |             —             |       —         |
 | **Finds sessions already dead**   |  **✅**  |   —   |    —     |       —       |      —       |             —             |       —         |
-| No proxy in the request path      |    ✅    |  ✅   |    ✅    |      ✅       |   proxy      |            ✅             |      ✅         |
+| **Reads usage of inactive accts** |  **✅**  |   —   |    —     |       —       |      —       |            ✅             |       —         |
+| No proxy, no wrapper, no restart  |    ✅    | wraps |    ✅    |      ✅       |   proxy      |            ✅             |      ✅         |
 
 If you only use Claude Code, [cux] and [clauth] are mature and you should look at them first.
 If you want a menu-bar GUI covering both, use [claude-account-switcher].
@@ -102,8 +103,10 @@ take that risk on the default path.
 > startup. The daemon still tracks Codex usage (from its session journals) and swaps ahead of
 > the limit, so the next start already has a fresh account.
 
-There are `mag run` / `mag crun` commands that *do* wrap the CLI in a pty to auto-resume after
-a hard limit. They are **experimental and off by default** — for exactly the reason above.
+This tool does one thing: switch accounts and show you what is left. It does not wrap, watch,
+restart, or otherwise manage your CLI sessions — an earlier version tried to, and brokering
+terminal capability negotiation on the CLI's behalf broke arrow keys and multi-line input in
+ways that kept resurfacing. That approach is gone.
 
 ## Correctness notes
 

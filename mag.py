@@ -7,29 +7,23 @@ claude-magazine — 複数の Claude Max アカウントを「弾倉」のよう
 - 弾倉スロット : service="claude-magazine"        / account=<slug>
   ※ 現用スロットには MCP の OAuth (mcpOAuth) が同居しているので claudeAiOauth だけを差し替える
 
-検知は 3 系統の多重化:
-  1. 実ヒット検知   … claude の端末出力に出る "session limit reached" 等（5h / 7d 両方）
-  2. statusLine 経由 … Claude Code が statusLine に渡す rate_limits.*.used_percentage
-  3. usage API      … https://api.anthropic.com/api/oauth/usage（起動時・切替時のみの低頻度）
+残量の見方は 2 系統:
+  1. statusLine 経由 … Claude Code が statusLine に渡す rate_limits（追加コストなし）
+  2. usage API      … https://api.anthropic.com/api/oauth/usage
+
+CLI 本体には干渉しない。端末を横取りしたり、走っているプロセスを止めたりはしない。
 """
 
 from __future__ import annotations
 
 import argparse
-import fcntl
 import json
 import os
-import pty
 import re
-import select
 import shutil
-import signal
-import struct
 import subprocess
 import sys
-import termios
 import time
-import tty
 import urllib.error
 import urllib.request
 import uuid
@@ -112,61 +106,6 @@ DEFAULT_CONFIG = {
     # 上限で落ちた後の再開時、自動で送信するプロンプト（空なら送らない）
     "auto_continue_prompt": "",
 }
-
-# ── 実ヒット検知パターン ────────────────────────────────────────────────
-# Claude Code 内部のラベル: five_hour="session limit", seven_day="weekly limit",
-#                           seven_day_opus="Opus limit", seven_day_sonnet="Sonnet limit"
-HIT_PATTERNS = [
-    (r"(?:session|5[- ]?hour|five[- ]?hour)\s+limit[^\n]{0,60}?(?:reached|exceeded|resets)", "five_hour"),
-    (r"(?:weekly|7[- ]?day|seven[- ]?day|Opus|Sonnet)\s+limit[^\n]{0,60}?(?:reached|exceeded|resets)", "seven_day"),
-    (r"usage limit reached", None),
-    (r"rate[ _-]?limit(?:_error)?[^\n]{0,40}(?:reached|exceeded|error)", None),
-    # "You have reached your session limit" のように限定語が後ろに来る形
-    (r"(?:reached|hit|exceeded)\s+(?:your\s+)?[^\n]{0,20}?(?:session|5[- ]?hour)\s+limit", "five_hour"),
-    (r"(?:reached|hit|exceeded)\s+(?:your\s+)?[^\n]{0,20}?(?:weekly|7[- ]?day)\s+limit", "seven_day"),
-    (r"(?:reached|hit|exceeded)\s+(?:your\s+)?[^\n]{0,20}?usage\s+limit", None),
-    (r"limit will reset at", None),
-    (r"(?:利用|使用)(?:上限|制限)[^\n]{0,20}(?:に達し|を超|超過)", None),
-]
-# 上限とは無関係な "... limit reached" を弾く
-HIT_EXCLUDE = re.compile(
-    r"(context limit|subagent|budget limit|fast limit|spend limit|concurrent|"
-    r"size limit|recursion|jit stack|token limit|nesting limit|export limit)",
-    re.I,
-)
-HIT_RE = [(re.compile(p, re.I), kind) for p, kind in HIT_PATTERNS]
-
-# 組織の支出上限で止められた場合。レート制限と違い時間では戻らず、管理者が枠を
-# 上げるまで解けない。ローカルの --max-budget-usd（"Budget limit reached ($1.20 of
-# $5.00 maximum)"）とは別物なので、そちらと取り違えないよう具体的に書く。
-SPEND_BLOCK_PATTERNS = [
-    r"hit your org(?:anization)?'?s?\s+monthly spend limit",
-    r"monthly spend limit",
-    # Codex は識別子そのままで出ることがある（workspace_member_usage_limit_reached 等）
-    r"workspace[ _](?:owner|member)[ _](?:usage[ _]limit[ _]reached|credits[ _]depleted)",
-    r"spend[ _]control[ _]reached",
-    r"organization'?s? (?:usage|spend) limit",
-    r"/usage-credits to ask your admin",
-    r"credit balance too low",
-    r"(?:組織|ワークスペース)の(?:月次)?(?:支出|利用)上限",
-]
-SPEND_BLOCK_RE = [re.compile(p, re.I) for p in SPEND_BLOCK_PATTERNS]
-# ローカルの予算指定はアカウントの問題ではないので、支出ブロック判定から外す
-LOCAL_BUDGET_RE = re.compile(r"budget limit reached \(\$", re.I)
-
-# Codex (ChatGPT) 側の上限メッセージ。バイナリ内の実文言に合わせてある。
-#   "You've hit your usage limit." / "You've hit your usage limit for <window>"
-CODEX_HIT_PATTERNS = [
-    (r"you'?ve hit your usage limit", None),
-    (r"usage limit reached", None),
-    (r"rate[ _-]?limit(?:_error)?[^\n]{0,40}(?:reached|exceeded)", None),
-    (r"(?:利用|使用)(?:上限|制限)[^\n]{0,20}(?:に達し|を超|超過)", None),
-]
-CODEX_HIT_RE = [(re.compile(p, re.I), kind) for p, kind in CODEX_HIT_PATTERNS]
-# Codex の 5h / 週次どちらに当たったかは文言から拾う
-CODEX_WEEKLY_RE = re.compile(r"(weekly|week|7[- ]?day)", re.I)
-ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\r")
-
 
 # ── 小物 ────────────────────────────────────────────────────────────────
 def now() -> float:
@@ -1542,380 +1481,6 @@ def read_live(sid: str) -> dict | None:
     return read_json(os.path.join(LIVE_DIR, f"{sid}.json"), None)
 
 
-# ── mag run: PTY で claude を包み、上限で自動リロード＆再開 ──────────────
-def parse_reset_time(text: str) -> float | None:
-    """"resets 9:50pm (Asia/Tokyo)" / "resets at 21:50" から復帰時刻を読む。"""
-    m = re.search(r"resets?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", text, re.I)
-    if not m:
-        return None
-    h, mi = int(m.group(1)), int(m.group(2) or 0)
-    ap = (m.group(3) or "").lower()
-    if ap == "pm" and h < 12:
-        h += 12
-    elif ap == "am" and h == 12:
-        h = 0
-    if h > 23 or mi > 59:
-        return None
-    base = datetime.now()
-    t = base.replace(hour=h, minute=mi, second=0, microsecond=0)
-    if t <= base:
-        t += timedelta(days=1)
-    # 5h 上限の復帰が 24 時間先ということはない
-    if t.timestamp() - now() > 8 * 3600:
-        return None
-    return t.timestamp()
-
-
-def month_end() -> float:
-    """今月末（ローカル時刻）。組織の月次支出上限はここで戻る見込み。"""
-    d = datetime.now()
-    nxt = d.replace(day=28) + timedelta(days=4)
-    first = nxt.replace(day=1, hour=0, minute=5, second=0, microsecond=0)
-    return first.timestamp()
-
-
-def detect_hit(text: str, provider: str = "claude") -> tuple[bool, str | None, float | None]:
-    rules = CODEX_HIT_RE if provider == "codex" else HIT_RE
-    # 支出ブロックを先に見る。文面が「limit」を含むため、後段の除外に
-    # 巻き込まれて見落とされていた。
-    for line in text.splitlines():
-        if LOCAL_BUDGET_RE.search(line):
-            continue      # ローカルの --max-budget-usd はアカウントの問題ではない
-        for rx in SPEND_BLOCK_RE:
-            if rx.search(line):
-                return True, "spend", None   # 復帰時刻は本人の窓から決める
-    for line in text.splitlines():
-        if HIT_EXCLUDE.search(line):
-            continue
-        for rx, kind in rules:
-            if rx.search(line):
-                if provider == "codex" and kind is None:
-                    kind = "seven_day" if CODEX_WEEKLY_RE.search(line) else "five_hour"
-                return True, kind, parse_reset_time(line)
-    return False, None, None
-
-
-def set_winsize(fd: int) -> None:
-    try:
-        sz = fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, b"\x00" * 8)
-        fcntl.ioctl(fd, termios.TIOCSWINSZ, sz)
-    except OSError:
-        pass
-
-
-def reset_terminal_modes() -> None:
-    """端末を素の状態へ戻す。
-
-    Claude Code / Codex は起動時にキー入力の拡張報告（kitty keyboard protocol、
-    modifyOtherKeys）や括弧付きペースト、マウス報告、代替画面を有効にする。
-    通常終了なら本人が戻すが、上限検知でこちらが強制終了させると戻されずに残る。
-    残ったままだと矢印キーが生のエスケープ列として見えたり、改行が効かなくなる。
-    後片付けはこちらが引き受ける。
-    """
-    seq = (
-        "\x1b[<u"          # kitty keyboard protocol を戻す
-        "\x1b[>4;m"        # modifyOtherKeys を既定へ
-        "\x1b[?2004l"      # 括弧付きペースト off
-        "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l"   # マウス報告 off
-        "\x1b[?1049l"      # 代替画面から戻る
-        "\x1b[?7h"         # 自動折返し on
-        "\x1b[?25h"        # カーソル表示
-        "\x1b[0m"          # 文字属性リセット
-        "\r"
-    )
-    try:
-        sys.stdout.write(seq)
-        sys.stdout.flush()
-    except (OSError, ValueError):
-        pass
-
-
-def banner(msg: str) -> None:
-    """自前の通知を出す。
-
-    相手が TUI を描いている最中に書くと行が割り込まれて画面が壊れるので、
-    行頭に戻し・行を消し・属性を戻してから出す。呼ぶのは子プロセスを
-    終わらせた後に限ること。
-    """
-    sys.stdout.write(f"\r\x1b[2K\x1b[0m\n\x1b[1;33m{msg}\x1b[0m\n")
-    sys.stdout.flush()
-
-
-def spawn_claude(argv: list, sid: str, on_hit, provider: str = "claude") -> tuple[int, str | None, float | None]:
-    """claude を PTY で起動。上限を検知したら子を畳んで (exit_code, kind, resets_at) を返す。"""
-    cfg = config()
-
-    # pty.fork() で作られる子側の端末は「既定値」で始まり、こちらの端末設定を
-    # 引き継がない。そのままだと子から見た端末の性質が実際の端末と食い違い、
-    #   - Ctrl-C が信号にならず ^C という文字として入ってしまう（ISIG 相当の差）
-    #   - 改行の扱いがずれて2行目以降の表示が崩れる（ICRNL/ONLCR 相当の差）
-    # といった不具合が出る。元の設定とウィンドウサイズを子側へ複製しておく。
-    parent_is_tty = sys.stdin.isatty()
-    mode = termios.tcgetattr(sys.stdin) if parent_is_tty else None
-    winsz = None
-    if parent_is_tty:
-        try:
-            winsz = fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, b"\x00" * 8)
-        except OSError:
-            winsz = None
-
-    # 端末を raw にするのは fork より「前」でなければならない。
-    # 子は起動直後に端末へ問い合わせ（キーボードプロトコルや背景色など）を投げ、
-    # その応答を stdin から読む。こちらが行バッファのままだと、応答は改行が来るまで
-    # 取り出せず子側がタイムアウトし、矢印キーが生のエスケープ列として入ったり
-    # 複数行入力が壊れたりする。しかもエコーが有効なので応答が画面に出てしまう。
-    old = None
-    if parent_is_tty:
-        old = mode
-        tty.setraw(sys.stdin.fileno())
-
-    try:
-        pid, master = pty.fork()
-    except OSError:
-        if old:
-            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old)
-        raise
-    if pid == 0:
-        # ここでの fd 0/1/2 は擬似端末の子側。実端末と同じ設定にしてから起動する。
-        try:
-            if mode is not None:
-                termios.tcsetattr(0, termios.TCSANOW, mode)
-            if winsz is not None:
-                fcntl.ioctl(0, termios.TIOCSWINSZ, winsz)
-        except (OSError, termios.error):
-            pass
-        os.execvp(argv[0], argv)
-        os._exit(127)
-
-    set_winsize(master)
-
-    def on_winch(signum, frame):
-        set_winsize(master)
-
-    prev_winch = signal.signal(signal.SIGWINCH, on_winch)
-
-    tail = ""
-    hit_kind = None
-    hit_reset = None
-    hit = False
-    last_live = 0.0
-    started = now()
-    # stdin が EOF（/dev/null・尽きたパイプ）になると select は即座に readable を
-    # 返し続けて busy-loop になる。EOF を検知した時点で監視対象から外す
-    # （パイプ経由でスクリプト的に入力を流し込むケースはそれまで機能させたい）。
-    stdin_eof = False
-    try:
-        while True:
-            stdin_fds = [] if stdin_eof else [sys.stdin]
-            try:
-                r, _, _ = select.select([master] + stdin_fds, [], [], 0.4)
-            except (OSError, InterruptedError):
-                break
-            if master in r:
-                try:
-                    chunk = os.read(master, 65536)
-                except OSError:
-                    break
-                if not chunk:
-                    break
-                os.write(sys.stdout.fileno(), chunk)
-                tail = (tail + ANSI_RE.sub("", chunk.decode("utf-8", "replace")))[-8192:]
-                found, kind, reset_at = detect_hit(tail, provider)
-                if found and not hit:
-                    hit, hit_kind, hit_reset = True, kind, reset_at
-                    tail = ""
-                    break
-            if sys.stdin in r:
-                try:
-                    data = os.read(sys.stdin.fileno(), 4096)
-                except OSError:
-                    data = b""
-                if data:
-                    os.write(master, data)
-                else:
-                    stdin_eof = True
-
-            # statusLine 経由のリアルタイム使用率（実ヒット前に切り替えるための保険）。
-            # これは Claude Code 固有の仕組みなので Codex では使えない。
-            if provider == "claude" and now() - last_live > cfg["live_poll_interval"]:
-                last_live = now()
-                lv = read_live(sid)
-                if (lv and now() - lv.get("ts", 0) < 60
-                        and lv.get("slug") == get_current("claude")
-                        and switch_grace_ok(lv.get("ts", 0))):
-                    for k, th in (("five_hour", cfg["five_hour_threshold"]),
-                                  ("seven_day", cfg["seven_day_threshold"])):
-                        pct = (lv.get(k) or {}).get("pct")
-                        if (pct is not None and pct >= th
-                                and now() - started > cfg["min_switch_interval"]
-                                and has_spare(lv.get("slug"))):
-                            hit, hit_kind, hit_reset = True, k, lv.get(k, {}).get("resets_at")
-                            break
-                if hit:
-                    break
-    finally:
-        signal.signal(signal.SIGWINCH, prev_winch)
-        if old:
-            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old)
-        if hit_kind is None and not hit:
-            # 子が自分で終わった／こちらが落ちた場合。子が後片付けを済ませていれば
-            # この列は無害だが、途中で死んでいた場合はこれが最後の砦になる。
-            reset_terminal_modes()
-
-    if hit:
-        # 子プロセスの TUI がまだ描画している最中にこちらが書き込むと、行が割り込まれて
-        # 画面が壊れる。先に子を終わらせ、画面を掃除してから知らせる。
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        deadline = now() + 5
-        while now() < deadline:
-            wpid, status = os.waitpid(pid, os.WNOHANG)
-            if wpid:
-                break
-            time.sleep(0.1)
-        else:
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            try:
-                os.waitpid(pid, 0)
-            except ChildProcessError:
-                pass
-        # 子が終了時に吐く後片付け（代替画面からの復帰など）を読み切ってから知らせる。
-        # 残したまま書くと、こちらの行に相手のエスケープが割り込む。
-        try:
-            deadline = now() + 1.0
-            while now() < deadline:
-                r, _, _ = select.select([master], [], [], 0.1)
-                if not r:
-                    break
-                chunk = os.read(master, 65536)
-                if not chunk:
-                    break
-                os.write(sys.stdout.fileno(), chunk)
-        except OSError:
-            pass
-        try:
-            os.close(master)
-        except OSError:
-            pass
-        reset_terminal_modes()
-        on_hit(hit_kind)
-        return 0, hit_kind, hit_reset
-
-    try:
-        _, status = os.waitpid(pid, 0)
-        code = os.waitstatus_to_exitcode(status)
-    except ChildProcessError:
-        code = 0
-    try:
-        os.close(master)
-    except OSError:
-        pass
-    return code, None, None
-
-
-def cmd_run(args) -> int:
-    """[実験的] claude を擬似端末で包む。
-
-    擬似端末で TUI を包むと、起動時の端末能力ネゴシエーションやキーボード
-    プロトコルの受け渡しに影響し、キー入力や改行の扱いが壊れることがある。
-    通常は常駐監視（mag watch）が Keychain を書き換えるだけで、走っている
-    セッションを止めずに切り替えられるので、こちらを使う必要はない。
-    上限後の自動再開がどうしても欲しい場合のみ。
-    """
-    cfg = config()
-    passthrough = list(args.claude_args or [])
-    if passthrough and passthrough[0] == "--":
-        passthrough = passthrough[1:]
-
-    # 起動前に弾を確認
-    rc = cmd_auto(argparse.Namespace(no_probe=False, verbose=True))
-    if rc == 2:
-        return 2
-
-    manages_session = not any(
-        a in passthrough for a in ("-c", "--continue", "-r", "--resume", "--session-id")
-    )
-    sid = str(uuid.uuid4())
-    if not manages_session:
-        # --resume <id> で渡されたセッション ID を引き継いで再開に使う
-        for flag in ("--resume", "-r", "--session-id"):
-            if flag in passthrough:
-                i = passthrough.index(flag)
-                if i + 1 < len(passthrough) and re.fullmatch(r"[0-9a-f-]{36}", passthrough[i + 1]):
-                    sid = passthrough[i + 1]
-                break
-    base = ["claude"] + passthrough
-    argv = base + (["--session-id", sid] if manages_session else [])
-
-    # 再開時に最初の一言を送りたい場合（workflow の続きなど）は位置引数で渡す
-    initial = getattr(args, "initial_prompt", None)
-    if initial:
-        argv = argv + [initial]
-
-    rounds = 0
-    while True:
-        rounds += 1
-        cur = get_current("claude")
-
-        def on_hit(kind, _cur=cur):
-            label = ({"five_hour": "5-hour", "seven_day": "weekly"} if LANG == "en"
-                     else {"five_hour": "5時間", "seven_day": "週次"}).get(kind or "five_hour",
-                     "usage" if LANG == "en" else "使用")
-            banner(T(f"[magazine] {_cur} hit its {label} limit — switching account…",
-                     f"[magazine] {_cur} が{label}上限に到達 — アカウントを切り替えます…"))
-
-        code, kind, resets = spawn_claude(argv, sid, on_hit)
-        if kind is None:
-            return code
-
-        # 出力からの実測 resets_at を優先し、取れなければ usage API で裏取りする
-        if resets is None and cur:
-            p = probe(cur)
-            if p.get("ok"):
-                blk = p.get(kind) or {}
-                if blk.get("pct") is not None:
-                    resets = blk.get("resets_at")
-        if cur:
-            set_cooldown(cur, kind, resets)
-
-        slug, report = next_slug(cur, probe_all=True)
-        if not slug:
-            banner(T("[magazine] All accounts are limited. Waiting for recovery.",
-                     "[magazine] 全アカウントが上限です。復帰待ちです。"))
-            for s_, why in report:
-                sys.stdout.write(f"   - {s_}: {why}\r\n")
-            bslug, when = soonest_reset()
-            if bslug:
-                sys.stdout.write(f"   最短復帰: {bslug} → {fmt_when(when)}\r\n")
-            sys.stdout.flush()
-            return 2
-
-        do_load(slug, f"auto after {kind}")
-        label = (find_account(slug) or {}).get("label", slug)
-        banner(T(f"[magazine] Switched to {label} [{slug}] — resuming (round {rounds})",
-                     f"[magazine] {label} [{slug}] に切り替えました — 会話を再開します (round {rounds})"))
-        time.sleep(1.0)
-
-        if manages_session:
-            argv = base + ["--resume", sid]
-        elif not any(a in base for a in ("-c", "--continue", "-r", "--resume")):
-            argv = base + ["-c"]
-        else:
-            argv = base
-
-        # workflow が走っていたなら、最初からやり直させず runId で続きから再開させる
-        wf = find_workflow(session_dir_for(sid))
-        if wf:
-            sys.stdout.write(f"   ⚙ workflow {wf['name']} ({wf['run_id']}) を続きから再開します\r\n")
-            sys.stdout.flush()
-            argv = argv + [wf_resume_prompt(wf)]
-
-
 # ── 止まったセッションの検出 / 再開 ─────────────────────────────────────
 PROJECTS_DIR = os.path.join(HOME, ".claude", "projects")
 STALL_RE = re.compile(
@@ -2187,23 +1752,6 @@ def set_cooldown_verified(slug: str, kind: str, resets_at=None, source: str = ""
     statusLine 由来の数値は「誰の数値か」を取り違えうる。裏取りせずに
     cooldown を張ると、まだ余裕のあるアカウントを外してしまう。
     """
-    if kind == "spend":
-        # 「支出上限」は多くの場合、単独で起きるのではなく連鎖の終端に出る:
-        #   プランの枠を使い切る → 方針により従量課金へ流れる → その枠も尽きる
-        # つまり根っこはレート制限なので、復帰はプランの窓のリセットで訪れる。
-        # 月末まで外すと、数時間で戻るアカウントを何日も遊ばせてしまう。
-        p = probe(slug)
-        best = None
-        if p.get("ok"):
-            for k in ("five_hour", "seven_day"):
-                blk = p.get(k) or {}
-                if blk.get("pct") is not None and blk.get("resets_at"):
-                    if blk["pct"] >= 95 and (best is None or blk["resets_at"] < best):
-                        best = blk["resets_at"]
-        set_cooldown(slug, kind, best or resets_at or (now() + config()["fallback_cooldown_five_hour"]))
-        log(f"spend block: {slug} は枠を使い切り従量課金側も上限"
-            f"（復帰見込み {fmt_when(best) if best else '約5時間後'}）")
-        return True
     p = probe(slug)
     if p.get("ok"):
         blk = p.get(kind) or {}
@@ -2430,79 +1978,6 @@ def cmd_watch(args) -> int:
             time.sleep(interval)
 
 
-def cmd_crun(args) -> int:
-    """codex を監視付きで起動し、上限に当たったら次弾を装填して直前セッションを再開する。
-
-    Codex には残量 API が無い（Cloudflare 403）ため、切替のトリガーは
-    出力に出る "You've hit your usage limit" の実ヒット検知のみ。
-    """
-    passthrough = list(args.codex_args or [])
-    if passthrough and passthrough[0] == "--":
-        passthrough = passthrough[1:]
-
-    accs = accounts_of("codex")
-    if not accs:
-        print("Codex の弾倉が空です。`codex login` のあと `mag add --provider codex` で登録してください。",
-              file=sys.stderr)
-        return 1
-
-    cur = get_current("codex")
-    need_swap = cur and cooldown_left(cur) > 0
-    if cur and not need_swap:
-        since = (state().get("last_switch_by") or {}).get("codex")
-        cw = codex_worst(only_after=since)
-        if cw:
-            print(f"[magazine/codex] {cur}: {cw['label']} {cw['pct']:.0f}%")
-            if cw["pct"] >= config()["hotswap_threshold"] or cw.get("reached"):
-                need_swap = True
-    if need_swap:
-        slug, report = next_slug(cur, probe_all=False, provider="codex")
-        if slug and slug != cur:
-            do_load(slug, "crun 起動前")
-            print(f"[magazine/codex] 🔁 次弾装填: {(find_account(slug) or {}).get('label', slug)}")
-        else:
-            print("[magazine/codex] 使える次弾がありません。現在の弾のまま起動します")
-
-    base = [find_codex_bin()] + passthrough
-    argv = list(base)
-    rounds = 0
-    while True:
-        rounds += 1
-        cur = get_current("codex")
-
-        def on_hit(kind, _cur=cur):
-            label = ({"five_hour": "5-hour", "seven_day": "weekly"} if LANG == "en"
-                     else {"five_hour": "5時間", "seven_day": "週次"}).get(kind or "five_hour",
-                     "usage" if LANG == "en" else "使用")
-            banner(T(f"[magazine/codex] {_cur} hit its {label} limit — switching account…",
-                     f"[magazine/codex] {_cur} が{label}上限に到達 — アカウントを切り替えます…"))
-
-        code, kind, resets = spawn_claude(argv, "codex", on_hit, provider="codex")
-        if kind is None:
-            return code
-
-        if cur:
-            set_cooldown(cur, kind, resets)
-        slug, report = next_slug(cur, probe_all=False, provider="codex")
-        if not slug:
-            banner(T("[magazine/codex] All accounts are limited.", "[magazine/codex] 全アカウントが上限です。"))
-            for s_, why in report:
-                sys.stdout.write(f"   - {s_}: {why}\r\n")
-            sys.stdout.flush()
-            return 2
-
-        do_load(slug, f"auto after {kind}")
-        label = (find_account(slug) or {}).get("label", slug)
-        banner(T(f"[magazine/codex] Switched to {label} — resuming (round {rounds})",
-                     f"[magazine/codex] {label} に切り替えました — セッションを再開します (round {rounds})"))
-        time.sleep(1.0)
-        # codex は直近セッションを --last で継続できる
-        if not any(a in base for a in ("resume", "exec")):
-            argv = base + ["resume", "--last"]
-        else:
-            argv = list(base)
-
-
 def cmd_doctor(args) -> int:
     ok = True
     print("── claude-magazine doctor ──")
@@ -2613,10 +2088,6 @@ Registering:
                    help=T("use codex to register a ChatGPT (codex CLI) account","codex を指定すると ChatGPT (codex CLI) 側に登録"))
     a.set_defaults(func=cmd_add)
 
-    a = sub.add_parser("crun", help=T("[experimental] wrap codex in a pty to auto-resume after a limit",
-                                  "[実験的] codex を擬似端末で包み上限後に自動再開"))
-    a.add_argument("codex_args", nargs=argparse.REMAINDER)
-    a.set_defaults(func=cmd_crun)
 
     a = sub.add_parser("remove", help=T("remove an account","アカウントを削除"))
     a.add_argument("slug"); a.set_defaults(func=cmd_remove)
@@ -2654,10 +2125,6 @@ Registering:
     a.add_argument("--kind", choices=["five_hour", "seven_day"]); a.add_argument("--slug")
     a.set_defaults(func=cmd_hit)
 
-    a = sub.add_parser("run", help=T("[experimental] wrap claude in a pty to auto-resume after a limit",
-                                 "[実験的] claude を擬似端末で包み上限後に自動再開"))
-    a.add_argument("claude_args", nargs=argparse.REMAINDER)
-    a.set_defaults(func=cmd_run, initial_prompt=None)
 
     a = sub.add_parser("watch", help=T("daemon: switch before limits, without stopping sessions","常駐監視：セッションを止めずに事前切替"))
     a.add_argument("--interval", type=float, default=20.0, help="live 監視の間隔（秒）")
