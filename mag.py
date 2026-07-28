@@ -639,6 +639,82 @@ def codex_worst(only_after: float = None) -> dict | None:
     return {**w, "plan": lim.get("plan"), "reached": lim.get("reached"), "ts": lim["ts"]}
 
 
+def codex_probe(slug: str, timeout: int = 90) -> dict | None:
+    """装填していない Codex アカウントの残量を取る。
+
+    Codex は残量 API を公開していないが、CODEX_HOME を向ければ設定ごと別の
+    アカウントとして動く。使い捨ての一時ディレクトリにその弾の auth.json を置き、
+    最小のリクエストを1回投げて、そこに記録された rate_limits を読む。
+    現用の ~/.codex/auth.json には一切触らないので、走っているセッションに影響しない。
+
+    ただしリクエストを1回消費するので、常時ポーリングには使わないこと。
+    """
+    auth = codex_stored_auth(slug)
+    if not auth:
+        return None
+    auth = codex_ensure_fresh(slug, auth)
+    import tempfile, shutil as _sh
+    home = tempfile.mkdtemp(prefix="mag-codex-")
+    try:
+        with open(os.path.join(home, "auth.json"), "w") as f:
+            json.dump(auth, f)
+        os.chmod(os.path.join(home, "auth.json"), 0o600)
+        src_cfg = os.path.expanduser("~/.codex/config.toml")
+        if os.path.exists(src_cfg):
+            try:
+                _sh.copy(src_cfg, os.path.join(home, "config.toml"))
+            except OSError:
+                pass
+        env = dict(os.environ)
+        env["CODEX_HOME"] = home
+        r = subprocess.run(
+            [find_codex_bin(), "exec", "--skip-git-repo-check", "OK"],
+            env=env, capture_output=True, text=True, timeout=timeout, cwd="/tmp")
+        out = (r.stdout or "") + (r.stderr or "")
+        if re.search(r"refresh token was revoked|could not be refreshed", out, re.I):
+            return {"dead": True}
+
+        best = None
+        for root, _d, names in os.walk(home):
+            for n in names:
+                if not n.endswith(".jsonl"):
+                    continue
+                try:
+                    with open(os.path.join(root, n), errors="replace") as f:
+                        for line in f:
+                            if '"rate_limits"' not in line:
+                                continue
+                            d = json.loads(line)
+                            rl = ((d.get("payload") or {}).get("rate_limits")) or {}
+                            if (rl.get("limit_id") or "codex") != "codex":
+                                continue
+                            if (rl.get("primary") or {}).get("used_percent") is None:
+                                continue
+                            ts = parse_iso(d.get("timestamp")) or 0
+                            if best is None or ts > best[0]:
+                                best = (ts, rl)
+                except (OSError, json.JSONDecodeError):
+                    continue
+        if not best:
+            return None
+        rl = best[1]
+        wins = []
+        for k in ("primary", "secondary"):
+            b = rl.get(k)
+            if not b or b.get("used_percent") is None:
+                continue
+            wm = b.get("window_minutes") or 0
+            wins.append({"label": (f"{wm // 60}h window" if wm < 10080 else f"{wm // 1440}d window")
+                         if LANG == "en" else (f"{wm // 60}時間枠" if wm < 10080 else f"{wm // 1440}日枠"),
+                         "pct": b["used_percent"], "resets_at": b.get("resets_at")})
+        return {"windows": wins, "plan": rl.get("plan_type"),
+                "reached": rl.get("rate_limit_reached_type"), "ts": best[0]}
+    except subprocess.TimeoutExpired:
+        return None
+    finally:
+        _sh.rmtree(home, ignore_errors=True)
+
+
 def find_codex_bin() -> str:
     for c in (os.environ.get("CODEX_BIN"), shutil.which("codex"),
               os.path.expanduser("~/.local/bin/codex"), "/opt/homebrew/bin/codex"):
@@ -775,13 +851,26 @@ def reconcile_current() -> dict:
     cauth = codex_live_auth() or {}
     ctok = (cauth.get("tokens") or {}).get("refresh_token")
     if ctok:
+        matched = None
         for a in accounts_of("codex"):
             st = (codex_stored_auth(a["slug"]) or {}).get("tokens") or {}
-            if st.get("refresh_token") == ctok and get_current("codex") != a["slug"]:
-                set_current("codex", a["slug"])
-                fixed["codex"] = a["slug"]
-                log(f"reconcile: codex の現在弾を {a['slug']} に修正")
+            if st.get("refresh_token") == ctok:
+                matched = a["slug"]
                 break
+        if matched is None:
+            # OpenAI も refresh token を使い捨てにするため、保管したスナップショットは
+            # 本体が更新した時点で失効する。現用の中身で保管庫を上書きして追従する。
+            live_id = codex_identity(cauth)
+            for a in accounts_of("codex"):
+                if (a.get("email") or "").lower() == (live_id.get("email") or "").lower():
+                    codex_store_auth(a["slug"], cauth)
+                    matched = a["slug"]
+                    log(f"sync: {a['slug']} の保管トークンを現用の最新版に更新（rotation 追従）")
+                    break
+        if matched and get_current("codex") != matched:
+            set_current("codex", matched)
+            fixed["codex"] = matched
+            log(f"reconcile: codex の現在弾を {matched} に修正")
     return fixed
 
 
@@ -1158,7 +1247,7 @@ def known_limits(slug: str) -> dict | None:
     return (state().get("limits") or {}).get(slug)
 
 
-def collect_limits(parallel_fetch: bool = True) -> list:
+def collect_limits(parallel_fetch: bool = True, args_ns=None) -> list:
     """全アカウントの残量を集めて、表示用の行に整える。"""
     rows = []
     claude_accs = accounts_of("claude")
@@ -1219,20 +1308,31 @@ def collect_limits(parallel_fetch: bool = True) -> list:
                 record_limits(slug, {"windows": row["windows"]})
             else:
                 row["note"] = T("no usage recorded yet (run codex once)", "残量の記録なし（codex で1回やり取りすると出ます）")
+        elif getattr(args_ns, "refresh", False):
+            # 現用でない弾も、使い捨ての CODEX_HOME で1回だけ問い合わせて実測する
+            got = codex_probe(slug)
+            if got and got.get("dead"):
+                row["note"] = T("needs re-login (refresh token revoked)", "要再ログイン（refresh token 失効）")
+            elif got:
+                row["windows"] = got["windows"]
+                row["reached"] = got.get("reached")
+                record_limits(slug, {"windows": row["windows"]})
+            else:
+                row["note"] = T("could not read usage", "残量を取得できませんでした")
         else:
             old = known_limits(slug)
             if old:
                 row["windows"] = old.get("windows") or []
                 row["stale_ts"] = old.get("ts")
             else:
-                row["note"] = T("never observed (activate it and use once)", "未観測（切り替えて1回使うと記録されます）")
+                row["note"] = T("never observed (use --refresh to measure)", "未観測（--refresh で実測できます）")
         rows.append(row)
     return rows
 
 
 def cmd_limits(args) -> int:
     """全マガジンの残量を一気に表示する。"""
-    rows = collect_limits()
+    rows = collect_limits(args_ns=args)
     if not rows:
         print(T("No accounts registered. Add one with `mag add`.",
               "アカウントが未登録です。`mag add` で登録してください。"))
@@ -2011,39 +2111,51 @@ def cmd_stalled(args) -> int:
 
 
 def cmd_resume(args) -> int:
+    """上限で止まったセッションを開き直す。
+
+    ここでは端末を横取りしない。使えるアカウントを選び、作業ディレクトリへ移り、
+    素の claude を exec するだけ。中断した workflow があれば、続きから再開させる
+    一言を最初のプロンプトとして渡す。
+    """
     target = args.session
     sessions = scan_sessions(args.hours, stalled_only=False)
     hit = next((s for s in sessions if s["session_id"].startswith(target)), None)
     if not hit:
-        print(f"✗ セッション {target} が見つかりません（直近 {args.hours:.0f}h）", file=sys.stderr)
+        print(T(f"✗ session {target} not found (last {args.hours:.0f}h)",
+                f"✗ セッション {target} が見つかりません（直近 {args.hours:.0f}h）"), file=sys.stderr)
         return 1
 
     wf = hit["workflow"]
     if wf and not args.no_workflow:
-        print("⚙ 中断した workflow を検出しました:")
+        cached = wf.get("cached_agents") or 0
+        print(T("⚙ Found an interrupted workflow:", "⚙ 中断した workflow を検出しました:"))
         print(f"   name  : {wf['name']}")
         print(f"   runId : {wf['run_id']}")
-        print(f"   script: {wf['script_path']}")
-        print("   再開時に以下を投入します:")
-        print(f"   → {wf_resume_prompt(wf)[:100]}…\n")
+        print(T(f"   cached: {cached} finished agent(s) will replay instead of re-running",
+                f"   再利用: 完了済み {cached} エージェントは再実行されません"))
 
     if hit["cwd"] and os.path.isdir(hit["cwd"]):
         os.chdir(hit["cwd"])
         print(f"cd {hit['cwd']}")
 
+    prompt = wf_resume_prompt(wf) if (wf and not args.no_workflow) else (args.prompt or "")
+    argv = [find_claude_bin(), "--resume", hit["session_id"]] + ([prompt] if prompt else [])
+
     if args.dry_run:
-        print(f"[dry-run] claude --resume {hit['session_id']}")
-        if wf and not args.no_workflow:
+        print("[dry-run] " + " ".join(argv[:3]) + (" <workflow 再開の一言>" if prompt else ""))
+        if prompt:
             print("[dry-run] 投入プロンプト:")
-            print(wf_resume_prompt(wf))
+            print(prompt)
         return 0
 
-    prompt = wf_resume_prompt(wf) if (wf and not args.no_workflow) else (args.prompt or "")
-    run_args = argparse.Namespace(
-        claude_args=["--resume", hit["session_id"]],
-        initial_prompt=prompt,
-    )
-    return cmd_run(run_args)
+    # 起動前に使えるアカウントへ寄せる（ネットワークは叩かない）
+    cmd_auto(argparse.Namespace(no_probe=True, provider="claude", verbose=False))
+    # 擬似端末を挟まず、このプロセスを claude に置き換える
+    try:
+        os.execvp(argv[0], argv)
+    except OSError as e:
+        print(T(f"✗ could not start claude: {e}", f"✗ claude を起動できません: {e}"), file=sys.stderr)
+        return 1
 
 
 # ── 常駐ホットスワップ ──────────────────────────────────────────────────
@@ -2517,6 +2629,9 @@ Registering:
 
     a = sub.add_parser("limits", aliases=["l"], help=T("show usage for every account at once","全アカウントの残量を一覧"))
     a.add_argument("--json", action="store_true", help=T("output JSON (for scripts)","JSON で出力（スクリプト用）"))
+    a.add_argument("--refresh", action="store_true",
+                   help=T("measure inactive Codex accounts too (costs one request each)",
+                          "装填していない Codex も実測する（1アカウントにつき1リクエスト消費）"))
     a.set_defaults(func=cmd_limits)
 
     a = sub.add_parser("load", aliases=["use"], help=T("switch to an account (partial name ok)","指定アカウントに切り替え（部分一致可）"))
