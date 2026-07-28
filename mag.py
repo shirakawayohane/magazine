@@ -98,9 +98,13 @@ DEFAULT_CONFIG = {
     "min_switch_interval": 20,
     # mag run が live ファイルを見に行く間隔（秒）
     "live_poll_interval": 2.0,
-    # mag watch（無停止ホットスワップ）が次弾に移る使用率。上限に当たる前に入れ替えるので
-    # 実ヒット用の閾値より少しだけ手前に置く。
-    "hotswap_threshold": 98.0,
+    # mag watch が次のアカウントに移る使用率。
+    # 枠を1%でも超えると、方針によっては従量課金へ流れて課金が発生する。
+    # 超えてから気付いても遅いので、必ず手前で移る。
+    "hotswap_threshold": 97.0,
+    # 上限が近いほど短い間隔で見る。並列に走る workflow は数十秒で数%を消すので、
+    # 一定間隔だと 97%→100% を丸ごと飛び越して課金域に入る。
+    "poll_schedule": [[90.0, 3.0], [80.0, 8.0], [0.0, 20.0]],   # [使用率, 間隔秒]
     # 現用の5h使用率がここに達したら、次弾に軽いクエリを1発投げて事前検証する
     # （認証切れ・凍結などを事前に検出する。CLAUDE_CODE_OAUTH_TOKEN 経由で現用 Keychain には触れない）
     "warm_threshold": 50.0,
@@ -441,6 +445,17 @@ def usage_summary(u: dict) -> dict:
                 out["seven_day"] = {"pct": lim["percent"],
                                     "resets_at": parse_iso(lim.get("resets_at")) or out["seven_day"]["resets_at"]}
     out["scoped"] = scoped
+    # 従量課金（プラン枠を超えた分の課金）の状態。枠を使い切ったあと、ここが
+    # 有効だと黙って課金が始まる。無効なら単に止まる。どちらなのかは
+    # 当たってからでは遅いので、残量と一緒に見えるようにしておく。
+    eu = (u or {}).get("extra_usage") or {}
+    out["metered"] = {
+        "enabled": eu.get("is_enabled"),
+        "limit_reached": eu.get("spend_limit_reached"),
+        "reason": eu.get("disabled_reason"),
+        "used": eu.get("used_credits"),
+        "monthly_limit": eu.get("monthly_limit"),
+    }
     return out
 
 
@@ -826,7 +841,7 @@ def probe(slug: str, quiet: bool = True) -> dict:
         u = fetch_usage(oauth)
         s = usage_summary(u)
         res.update({"ok": True, "five_hour": s["five_hour"], "seven_day": s["seven_day"],
-                    "scoped": s.get("scoped", [])})
+                    "scoped": s.get("scoped", []), "metered": s.get("metered") or {}})
     except Limited:
         # usage エンドポイント側の絞り。アカウントの可否は判定できない＝不明として扱う。
         res["error"] = T("usage API returned 429 (usage unknown; requests may still work)", "使用量APIが429（残量不明・リクエストは通る場合あり）")
@@ -914,7 +929,8 @@ def next_slug(after: str | None, probe_all: bool = True,
         cand = slugs[(start + i) % len(slugs)]
         if cooldown_left(cand) > 0:
             cd = state()["cooldowns"][cand]
-            report.append((cand, T("org spend limit (admin action needed)", "組織の支出上限（管理者対応が必要）")
+            report.append((cand, T(f"spent, metered also capped → {fmt_when(cd['until'])}",
+                                   f"枠+従量課金とも上限 → {fmt_when(cd['until'])}")
                                   if cd.get("kind") == "spend"
                                   else f"cooldown → {fmt_when(cd['until'])}"))
             continue
@@ -1114,8 +1130,8 @@ def _print_magazine(accs: list, prov: str, args) -> int:
         if left > 0:
             cd = state()["cooldowns"][slug]
             if cd.get("kind") == "spend":
-                print(T("    ⛔ org spend limit — needs an admin to raise it",
-                        "    ⛔ 組織の支出上限 — 管理者が枠を上げるまで戻りません"))
+                print(T(f"    ⛔ plan window spent, metered credits also capped → {fmt_when(cd['until'])}",
+                        f"    ⛔ 枠を使い切り従量課金も上限 → {fmt_when(cd['until'])}"))
             else:
                 print(T(f"    ⏳ limited ({cd.get('kind')}) → {fmt_when(cd['until'])}",
                         f"    ⏳ 上限到達 ({cd.get('kind')}) → {fmt_when(cd['until'])}"))
@@ -1177,6 +1193,7 @@ def collect_limits(parallel_fetch: bool = True) -> list:
             for sc in p.get("scoped") or []:
                 row["windows"].append({"label": T(f"weekly/{sc['model']}", f"週次/{sc['model']}"), "pct": sc["pct"],
                                        "resets_at": sc.get("resets_at"), "scoped": True})
+            row["metered"] = p.get("metered") or {}
             record_limits(slug, {"windows": row["windows"]})
         else:
             row["note"] = p.get("error") or T("unavailable", "取得不可")
@@ -1238,8 +1255,8 @@ def cmd_limits(args) -> int:
             if r["cooldown"] > 0:
                 cd = state()["cooldowns"][r["slug"]]
                 if cd.get("kind") == "spend":
-                    head += T("  \033[31m⛔ org spend limit — needs an admin to raise it\033[0m",
-                              "  \033[31m⛔ 組織の支出上限 — 管理者が枠を上げるまで戻りません\033[0m")
+                    head += T(f"  \033[31m⛔ plan window spent, metered credits also capped → {fmt_when(cd['until'])}\033[0m",
+                              f"  \033[31m⛔ 枠を使い切り従量課金も上限 → {fmt_when(cd['until'])}\033[0m")
                 else:
                     head += T(f"  \033[31m⏳ limited → {fmt_when(cd['until'])}\033[0m",
                               f"  \033[31m⏳ 上限到達 → {fmt_when(cd['until'])}\033[0m")
@@ -1252,6 +1269,13 @@ def cmd_limits(args) -> int:
                 dim = "\033[2m" if w.get("scoped") else ""
                 print(f"      {dim}{w['label']:<12}\033[0m {bar(w['pct'])}"
                       f"   reset {fmt_when(w.get('resets_at'))}")
+            mt = r.get("metered") or {}
+            if mt.get("limit_reached"):
+                print(T("      \033[31m⛔ metered credits exhausted (org-capped) — this account just stops\033[0m",
+                        "      \033[31m⛔ 従量課金枠も使い切り（組織で停止中）— このアカウントは止まります\033[0m"))
+            elif mt.get("enabled"):
+                print(T("      \033[33m💸 metered billing ON — going over the plan window will cost money\033[0m",
+                        "      \033[33m💸 従量課金が有効 — 枠を超えると課金されます\033[0m"))
             if r.get("stale_ts"):
                 print(f"      \033[2m(前回観測: {datetime.fromtimestamp(r['stale_ts']):%m/%d %H:%M} 時点)\033[0m")
             if r.get("reached"):
@@ -1459,7 +1483,7 @@ def detect_hit(text: str, provider: str = "claude") -> tuple[bool, str | None, f
             continue      # ローカルの --max-budget-usd はアカウントの問題ではない
         for rx in SPEND_BLOCK_RE:
             if rx.search(line):
-                return True, "spend", month_end()
+                return True, "spend", None   # 復帰時刻は本人の窓から決める
     for line in text.splitlines():
         if HIT_EXCLUDE.search(line):
             continue
@@ -2052,10 +2076,21 @@ def set_cooldown_verified(slug: str, kind: str, resets_at=None, source: str = ""
     cooldown を張ると、まだ余裕のあるアカウントを外してしまう。
     """
     if kind == "spend":
-        # 組織の支出上限。残量には表れない（枠が余っていても止められる）ので
-        # 使用率との突き合わせでは検証できない。申告をそのまま信じる。
-        set_cooldown(slug, kind, resets_at or month_end())
-        log(f"spend block: {slug} は組織の支出上限で停止（管理者の対応が必要）")
+        # 「支出上限」は多くの場合、単独で起きるのではなく連鎖の終端に出る:
+        #   プランの枠を使い切る → 方針により従量課金へ流れる → その枠も尽きる
+        # つまり根っこはレート制限なので、復帰はプランの窓のリセットで訪れる。
+        # 月末まで外すと、数時間で戻るアカウントを何日も遊ばせてしまう。
+        p = probe(slug)
+        best = None
+        if p.get("ok"):
+            for k in ("five_hour", "seven_day"):
+                blk = p.get(k) or {}
+                if blk.get("pct") is not None and blk.get("resets_at"):
+                    if blk["pct"] >= 95 and (best is None or blk["resets_at"] < best):
+                        best = blk["resets_at"]
+        set_cooldown(slug, kind, best or resets_at or (now() + config()["fallback_cooldown_five_hour"]))
+        log(f"spend block: {slug} は枠を使い切り従量課金側も上限"
+            f"（復帰見込み {fmt_when(best) if best else '約5時間後'}）")
         return True
     p = probe(slug)
     if p.get("ok"):
@@ -2266,7 +2301,15 @@ def cmd_watch(args) -> int:
                                 label = {"five_hour": "5h", "seven_day": "7d"}[k]
                                 hotswap(k, f"{label} {pct:.0f}%", (p.get(k) or {}).get("resets_at"))
                                 break
-            time.sleep(interval)
+
+            # 上限が近いほど短い間隔で見る（枠を超えて課金域に入らないため）
+            pct_now = live_five_hour_pct() or 0.0
+            nap = interval
+            for edge, sec in cfg.get("poll_schedule") or []:
+                if pct_now >= edge:
+                    nap = min(interval, sec) if interval < 20 else sec
+                    break
+            time.sleep(nap)
         except KeyboardInterrupt:
             print("\n👁 watch 停止")
             return 0
