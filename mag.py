@@ -2095,6 +2095,41 @@ def cmd_watch(args) -> int:
             time.sleep(interval)
 
 
+def watch_daemon_state() -> str:
+    """常駐監視が動いているか。見え方は OS ごとに違う。"""
+    try:
+        if IS_MAC:
+            r = subprocess.run(
+                ["launchctl", "print", f"gui/{os.getuid()}/com.magazine.watch"],
+                capture_output=True, text=True, timeout=15)
+            if "state = running" in r.stdout:
+                return T("running", "稼働中")
+            r = subprocess.run(
+                ["launchctl", "print", f"gui/{os.getuid()}/com.claude-magazine.watch"],
+                capture_output=True, text=True, timeout=15)
+            if "state = running" in r.stdout:
+                return T("running", "稼働中")
+            return T("not running (re-run install.sh to enable)",
+                     "停止中（install.sh を再実行すると入ります）")
+        if IS_WINDOWS:
+            r = subprocess.run(["schtasks", "/query", "/tn", "magazine-watch"],
+                               capture_output=True, text=True, timeout=15)
+            if r.returncode == 0:
+                return (T("registered and running", "登録済み・実行中")
+                        if "Running" in r.stdout or "実行中" in r.stdout
+                        else T("registered", "登録済み"))
+            return T("not registered (windows\\register-task.ps1)",
+                     "未登録（windows\\register-task.ps1 で登録）")
+        r = subprocess.run(["systemctl", "--user", "is-active", "magazine-watch"],
+                           capture_output=True, text=True, timeout=15)
+        if r.stdout.strip() == "active":
+            return T("running", "稼働中")
+        return T("not running (systemctl --user enable --now magazine-watch)",
+                 "停止中（systemctl --user enable --now magazine-watch）")
+    except (OSError, subprocess.SubprocessError):
+        return T("unknown", "不明")
+
+
 def cmd_doctor(args) -> int:
     ok = True
     print(T("-- magazine doctor --", "-- magazine doctor --"))
@@ -2113,7 +2148,8 @@ def cmd_doctor(args) -> int:
         for a in accs:
             has = (codex_stored_auth(a["slug"]) if prov == "codex"
                    else stored_oauth(a["slug"])) is not None
-            print(f"  - {a['slug']:<32} {'OK' if has else 'Keychain に弾なし'}")
+            mark = "OK" if has else T("credential missing", "認証情報なし")
+            print(f"  - {a['slug']:<32} {mark}")
             ok &= has
     # `claude auth status` はプロフィールをキャッシュしており Keychain の差し替えに
     # 追従しない（別アカウントを表示し続ける）。実際に入っている弾は
@@ -2122,8 +2158,9 @@ def cmd_doctor(args) -> int:
     live_rt = (current_oauth() or {}).get("refreshToken")
     real = next((a for a in accounts_of("claude")
                  if (stored_oauth(a["slug"]) or {}).get("refreshToken") == live_rt), None)
-    print(f"実際の Claude 現用  : {real.get('label') if real else '弾倉外のアカウント'}"
-          f" [{real['slug'] if real else '?'}]")
+    name = real.get("label") if real else T("an unregistered account", "未登録のアカウント")
+    print(T(f"active Claude acct : {name} [{real['slug'] if real else '?'}]",
+            f"実際の Claude 現用 : {name} [{real['slug'] if real else '?'}]"))
     st = auth_status()
     if real and st.get("email") and st["email"] != real.get("email"):
         print(f"  ※ `claude auth status` は {st['email']} と表示しますが、"
@@ -2131,24 +2168,27 @@ def cmd_doctor(args) -> int:
     if accounts_of("codex"):
         cauth = codex_live_auth()
         ident = codex_identity(cauth) if cauth else {}
-        print(f"codex login status : {ident.get('email', '未ログイン')} ({ident.get('plan', '?')})")
-    sl_script = os.path.join(HOME, ".claude", "statusline-command.sh")
+        print(T(f"codex account      : {ident.get('email') or 'not signed in'} ({ident.get('plan') or '?'})",
+                f"codex アカウント   : {ident.get('email') or '未ログイン'} ({ident.get('plan') or '?'})"))
     hooked = False
-    if os.path.exists(sl_script):
-        with open(sl_script) as f:
-            hooked = "mag.py" in f.read()
-    print(f"statusLine 連携    : {'OK' if hooked else '未接続（mag install-statusline で接続）'}")
-    r = subprocess.run(["launchctl", "print", f"gui/{os.getuid()}/com.claude-magazine.watch"],
-                        capture_output=True, text=True)
-    watching = "state = running" in r.stdout
-    print(f"watch 常駐         : {'稼働中' if watching else '停止中（launchctl bootstrap で起動）'}")
+    for fn in ("statusline-command.sh", "statusline-command.cmd"):
+        p_ = os.path.join(claude_config_dir(), fn)
+        if os.path.exists(p_):
+            with open(p_, errors="replace") as f:
+                body = f.read()
+            # 実体を直接指すことも、PATH 上の mag（symlink）を指すこともある
+            hooked = hooked or ("statusline" in body and re.search(r"\bmag(\.py)?\b", body) is not None)
+    print(T(f"statusLine hook    : {'OK' if hooked else 'not wired (mag install-statusline)'}",
+            f"statusLine 連携    : {'OK' if hooked else '未接続（mag install-statusline で接続）'}"))
+    print(T(f"watch daemon       : {watch_daemon_state()}",
+            f"watch 常駐         : {watch_daemon_state()}"))
     warm = state().get("warm") or {}
     if warm:
-        print("次弾ウォームアップ :")
+        print(T("pre-checked next   :", "次の候補の事前検証 :"))
         for slug, w in warm.items():
             mark = "OK" if w.get("ok") else f"NG ({w.get('msg', '')[:40]})"
             print(f"  - {slug:<32} {mark}")
-    print(f"ログ               : {LOG_PATH}")
+    print(T(f"log                : {LOG_PATH}", f"ログ               : {LOG_PATH}"))
     return 0 if ok else 1
 
 
