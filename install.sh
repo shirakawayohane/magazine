@@ -16,7 +16,12 @@ ok()   { printf "  \033[32m✓\033[0m %s\n" "$*"; }
 warn() { printf "  \033[33m!\033[0m %s\n" "$*"; }
 die()  { printf "  \033[31m✗\033[0m %s\n" "$*" >&2; exit 1; }
 
-[ "$(uname)" = "Darwin" ] || die "macOS 専用です（ログインキーチェーンを使います）"
+OS="$(uname -s)"
+case "$OS" in
+  Darwin) PLATFORM=mac ;;
+  Linux)  PLATFORM=linux ;;
+  *)      die "未対応の環境です: $OS（Windows は windows\\install.ps1 を使ってください）" ;;
+esac
 command -v python3 >/dev/null || die "python3 が必要です"
 
 # パイプ実行かクローン実行かを見分ける。パイプならソースを取りに行く。
@@ -67,20 +72,43 @@ if [ -t 0 ]; then ASK=1; else ASK=0; warn "非対話実行なので、任意項�
 confirm() { [ "$ASK" = 1 ] || return 1; read -r -p "$1 [y/N] " a; [[ "${a:-N}" =~ ^[Yy]$ ]]; }
 
 # ── シェル連携（任意）────────────────────────────────────────────────────
-if [ -d "$HOME/.config/fish" ] && confirm "claude / codex の起動前に自動でアカウントを選ぶようにしますか?"; then
-  mkdir -p "$HOME/.config/fish/conf.d"
-  cp "$SRC_DIR/shell/magazine.fish" "$HOME/.config/fish/conf.d/magazine.fish"
-  ok "fish: ~/.config/fish/conf.d/magazine.fish（外すときはこのファイルを消すだけ）"
+if confirm "claude / codex の起動前に自動でアカウントを選ぶようにしますか?"; then
+  if [ -d "$HOME/.config/fish" ]; then
+    mkdir -p "$HOME/.config/fish/conf.d"
+    cp "$SRC_DIR/shell/magazine.fish" "$HOME/.config/fish/conf.d/magazine.fish"
+    ok "fish: ~/.config/fish/conf.d/magazine.fish"
+  fi
+  for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+    [ -f "$rc" ] || continue
+    if ! grep -q "magazine.sh" "$rc" 2>/dev/null; then
+      printf '\n# magazine\n[ -f "%s/shell/magazine.sh" ] && . "%s/shell/magazine.sh"\n' \
+        "$SRC_DIR" "$SRC_DIR" >> "$rc"
+      ok "$(basename "$rc") に読み込み行を追加"
+    fi
+  done
+  warn "外すときは追加した行、または conf.d のファイルを消してください"
 fi
 
 # ── 常駐監視（任意）──────────────────────────────────────────────────────
 if confirm "上限の手前で自動的にアカウントを切り替える常駐監視を入れますか?"; then
-  mkdir -p "$(dirname "$PLIST")"
-  sed -e "s|__HOME__|$HOME|g" -e "s|__MAG__|$SRC_DIR/mag.py|g" \
-      "$SRC_DIR/launchd/com.magazine.watch.plist.template" > "$PLIST"
-  launchctl bootout "gui/$(id -u)" "$PLIST" 2>/dev/null || true
-  launchctl bootstrap "gui/$(id -u)" "$PLIST"
-  ok "常駐監視を起動（停止: launchctl bootout gui/$(id -u) $PLIST）"
+  if [ "$PLATFORM" = mac ]; then
+    mkdir -p "$(dirname "$PLIST")"
+    sed -e "s|__HOME__|$HOME|g" -e "s|__MAG__|$SRC_DIR/mag.py|g" \
+        "$SRC_DIR/launchd/com.magazine.watch.plist.template" > "$PLIST"
+    launchctl bootout "gui/$(id -u)" "$PLIST" 2>/dev/null || true
+    launchctl bootstrap "gui/$(id -u)" "$PLIST"
+    ok "常駐監視を起動（停止: launchctl bootout gui/$(id -u) $PLIST）"
+  elif command -v systemctl >/dev/null; then
+    UNIT_DIR="$HOME/.config/systemd/user"
+    mkdir -p "$UNIT_DIR"
+    sed -e "s|__PYTHON__|$(command -v python3)|g" -e "s|__MAG__|$SRC_DIR/mag.py|g" \
+        "$SRC_DIR/systemd/magazine-watch.service.template" > "$UNIT_DIR/magazine-watch.service"
+    systemctl --user daemon-reload
+    systemctl --user enable --now magazine-watch.service
+    ok "常駐監視を起動（停止: systemctl --user disable --now magazine-watch）"
+  else
+    warn "systemd が見つかりません。'mag watch' を手動で起動してください"
+  fi
 else
   warn "常駐監視なし。'mag watch' で手動起動、または再度 install.sh を実行してください"
 fi

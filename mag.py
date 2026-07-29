@@ -194,41 +194,117 @@ def fmt_when(epoch: float | None) -> str:
             else f"{dt.strftime('%m/%d %H:%M')} (残り{rel})")
 
 
-# ── Keychain ────────────────────────────────────────────────────────────
+# ── 認証情報の保管 ──────────────────────────────────────────────────────
+# macOS はログインキーチェーンを使う。Linux / Windows にはそれに当たる共通の
+# 置き場が無いので、権限を絞ったファイルに置く。Claude Code 自身も macOS 以外では
+# ~/.claude/.credentials.json に平文で置いているので、保護の強さはそれと同じ。
+IS_MAC = sys.platform == "darwin"
+IS_WINDOWS = os.name == "nt"
+SECRETS_DIR = os.path.join(ROOT, "secrets")
+
+
+def use_keychain() -> bool:
+    return IS_MAC and shutil.which("security") is not None
+
+
+def _secret_path(service: str, account: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", f"{service}__{account}")
+    return os.path.join(SECRETS_DIR, safe + ".json")
+
+
 def kc_read(service: str, account: str) -> dict | None:
-    r = subprocess.run(
-        ["security", "find-generic-password", "-s", service, "-a", account, "-w"],
-        capture_output=True, text=True,
-    )
-    if r.returncode != 0:
-        return None
-    raw = r.stdout.strip()
-    if not raw:
-        return None
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        return None
+    if use_keychain():
+        r = subprocess.run(
+            ["security", "find-generic-password", "-s", service, "-a", account, "-w"],
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            return None
+        raw = r.stdout.strip()
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+    return read_json(_secret_path(service, account), None)
 
 
 def kc_write(service: str, account: str, data: dict) -> None:
-    payload = json.dumps(data, separators=(",", ":"))
-    r = subprocess.run(
-        ["security", "add-generic-password", "-U", "-s", service, "-a", account,
-         "-D", "application password", "-w", payload],
-        capture_output=True, text=True,
-    )
-    if r.returncode != 0:
-        raise RuntimeError(f"Keychain 書き込み失敗 ({service}/{account}): {r.stderr.strip()}")
+    if use_keychain():
+        payload = json.dumps(data, separators=(",", ":"))
+        r = subprocess.run(
+            ["security", "add-generic-password", "-U", "-s", service, "-a", account,
+             "-D", "application password", "-w", payload],
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            raise RuntimeError(f"Keychain 書き込み失敗 ({service}/{account}): {r.stderr.strip()}")
+        return
+    path = _secret_path(service, account)
+    try:
+        os.makedirs(SECRETS_DIR, exist_ok=True)
+        harden_path(SECRETS_DIR, 0o700)
+        write_json(path, data)
+        harden_path(path, 0o600)
+    except OSError as e:
+        raise RuntimeError(f"認証情報の書き込みに失敗 ({service}/{account}): {e}")
 
 
 def kc_delete(service: str, account: str) -> None:
-    subprocess.run(["security", "delete-generic-password", "-s", service, "-a", account],
-                   capture_output=True, text=True)
+    if use_keychain():
+        subprocess.run(["security", "delete-generic-password", "-s", service, "-a", account],
+                       capture_output=True, text=True)
+        return
+    try:
+        os.remove(_secret_path(service, account))
+    except OSError:
+        pass
+
+
+def harden_path(path: str, mode: int) -> None:
+    """本人だけが読めるようにする。Windows は POSIX 権限が効かないので ACL で絞る。"""
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        pass
+    if not IS_WINDOWS:
+        return
+    try:
+        user = os.environ.get("USERNAME") or ""
+        if not user:
+            return
+        subprocess.run(["icacls", path, "/inheritance:r", "/grant:r", f"{user}:(F)"],
+                       capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+# ── 現用スロット ────────────────────────────────────────────────────────
+# macOS は Keychain。それ以外では Claude Code 自身が使う
+# <CLAUDE_CONFIG_DIR or ~/.claude>/.credentials.json を読み書きする。
+def claude_config_dir() -> str:
+    return os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude")
+
+
+def claude_creds_file() -> str:
+    return os.path.join(claude_config_dir(), ".credentials.json")
 
 
 def live_creds() -> dict:
-    return kc_read(LIVE_SERVICE, LIVE_ACCOUNT) or {}
+    if use_keychain():
+        return kc_read(LIVE_SERVICE, LIVE_ACCOUNT) or {}
+    return read_json(claude_creds_file(), None) or {}
+
+
+def write_live_creds(creds: dict) -> None:
+    if use_keychain():
+        kc_write(LIVE_SERVICE, LIVE_ACCOUNT, creds)
+        return
+    path = claude_creds_file()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    write_json(path, creds)
+    harden_path(path, 0o600)
 
 
 def current_oauth() -> dict | None:
@@ -257,7 +333,7 @@ def install_oauth(oauth: dict) -> None:
     last_err = None
     for attempt in range(3):
         try:
-            kc_write(LIVE_SERVICE, LIVE_ACCOUNT, creds)
+            write_live_creds(creds)
         except RuntimeError as e:
             last_err = e
             time.sleep(0.2)
@@ -271,11 +347,11 @@ def install_oauth(oauth: dict) -> None:
     # ここまで来たら壊れている可能性がある。元の弾に戻す。
     if before.get("claudeAiOauth"):
         try:
-            kc_write(LIVE_SERVICE, LIVE_ACCOUNT, before)
+            write_live_creds(before)
             log("install_oauth: 失敗したため元の弾へロールバックしました")
         except RuntimeError:
             log("install_oauth: ロールバックにも失敗（要 `claude auth login`）")
-    raise last_err or RuntimeError(T("Failed to write the credential to the keychain", "Keychain への書き込みに失敗しました"))
+    raise last_err or RuntimeError(T("Failed to write the credential", "認証情報の書き込みに失敗しました"))
 
 
 def stored_oauth(slug: str) -> dict | None:
@@ -2047,23 +2123,49 @@ def cmd_doctor(args) -> int:
 
 
 def cmd_install_statusline(args) -> int:
-    """既存の statusline-command.sh を mag statusline 経由に差し替える（バックアップ付き）。"""
-    path = os.path.join(HOME, ".claude", "statusline-command.sh")
+    """statusLine から mag を呼ぶようにする（既存設定はバックアップする）。
+
+    走っているセッションの残量は、Claude Code が statusLine に渡す JSON に
+    含まれている。ここを経由すれば追加の API コール無しで読める。
+    """
+    conf_dir = claude_config_dir()
+    os.makedirs(conf_dir, exist_ok=True)
+    # このファイル自身の位置を使う。データ置き場（ROOT）とは別物。
+    me = os.path.abspath(__file__)
+    py = sys.executable or ("python" if IS_WINDOWS else "python3")
+
+    if IS_WINDOWS:
+        path = os.path.join(conf_dir, "statusline-command.cmd")
+        script = f'@echo off\r\n"{py}" "{me}" statusline\r\n'
+    else:
+        path = os.path.join(conf_dir, "statusline-command.sh")
+        script = f'#!/bin/bash\n# magazine 連携 statusLine\nexec "{py}" "{me}" statusline\n'
+
     if os.path.exists(path):
         bak = path + f".bak.{int(now())}"
         with open(path) as f:
             old = f.read()
         with open(bak, "w") as f:
             f.write(old)
-        print(f"バックアップ: {bak}")
-    script = f"""#!/bin/bash
-# claude-magazine 連携 statusLine
-exec python3 {os.path.join(ROOT, 'mag.py')} statusline
-"""
-    with open(path, "w") as f:
+        print(T(f"backup: {bak}", f"バックアップ: {bak}"))
+
+    with open(path, "w", newline="") as f:
         f.write(script)
-    os.chmod(path, 0o755)
-    print(f"✓ statusLine を mag 経由に接続: {path}")
+    if not IS_WINDOWS:
+        os.chmod(path, 0o755)
+
+    # settings.json の statusLine もこのファイルを指すようにしておく
+    settings_path = os.path.join(conf_dir, "settings.json")
+    settings = read_json(settings_path, None)
+    if isinstance(settings, dict):
+        want = f'"{path}"' if IS_WINDOWS else f'bash "{path}"'
+        cur = (settings.get("statusLine") or {}).get("command")
+        if cur != want:
+            settings["statusLine"] = {"type": "command", "command": want}
+            write_json(settings_path, settings)
+            print(T("settings.json: statusLine updated", "settings.json の statusLine を更新"))
+    print(T(f"✓ statusLine now goes through mag: {path}",
+            f"✓ statusLine を mag 経由に接続: {path}"))
     return 0
 
 

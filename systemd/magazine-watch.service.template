@@ -1,0 +1,12 @@
+[Unit]
+Description=magazine — switch AI subscription accounts before they hit a limit
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=__PYTHON__ __MAG__ watch
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
