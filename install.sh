@@ -1,26 +1,47 @@
 #!/usr/bin/env bash
 # magazine installer
+#
+#   curl -fsSL https://raw.githubusercontent.com/shirakawayohane/magazine/main/install.sh | bash
+#
+# もしくはクローンしたディレクトリで ./install.sh
 set -euo pipefail
 
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DATA_DIR="$HOME/.claude-magazine"
+REPO_URL="${MAGAZINE_REPO:-https://github.com/shirakawayohane/magazine}"
+SRC_DIR="${MAGAZINE_SRC:-$HOME/.local/share/magazine}"
 BIN_DIR="$HOME/.local/bin"
 PLIST="$HOME/Library/LaunchAgents/com.magazine.watch.plist"
 
 say()  { printf "\033[1m%s\033[0m\n" "$*"; }
 ok()   { printf "  \033[32m✓\033[0m %s\n" "$*"; }
 warn() { printf "  \033[33m!\033[0m %s\n" "$*"; }
+die()  { printf "  \033[31m✗\033[0m %s\n" "$*" >&2; exit 1; }
 
-[ "$(uname)" = "Darwin" ] || { echo "macOS only (uses the login keychain)." >&2; exit 1; }
-command -v python3 >/dev/null || { echo "python3 is required." >&2; exit 1; }
+[ "$(uname)" = "Darwin" ] || die "macOS 専用です（ログインキーチェーンを使います）"
+command -v python3 >/dev/null || die "python3 が必要です"
 
-say "magazine をインストールします"
+# パイプ実行かクローン実行かを見分ける。パイプならソースを取りに行く。
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-/nonexistent}")" 2>/dev/null && pwd || true)"
+if [ -n "$HERE" ] && [ -f "$HERE/mag.py" ]; then
+  SRC_DIR="$HERE"
+  say "magazine をインストールします（$SRC_DIR）"
+else
+  say "magazine をインストールします"
+  command -v git >/dev/null || die "git が必要です"
+  if [ -d "$SRC_DIR/.git" ]; then
+    git -C "$SRC_DIR" pull --ff-only --quiet || warn "更新に失敗しました。既存のものを使います"
+    ok "ソースを更新: $SRC_DIR"
+  else
+    mkdir -p "$(dirname "$SRC_DIR")"
+    git clone --depth 1 --quiet "$REPO_URL" "$SRC_DIR" || die "クローンに失敗しました: $REPO_URL"
+    ok "ソースを取得: $SRC_DIR"
+  fi
+fi
 
-mkdir -p "$DATA_DIR"/{logs,live} "$BIN_DIR"
-ok "データディレクトリ: $DATA_DIR"
+[ -f "$SRC_DIR/mag.py" ] || die "mag.py が見つかりません: $SRC_DIR"
 
-ln -sf "$REPO_DIR/mag.py" "$BIN_DIR/mag"
-chmod +x "$REPO_DIR/mag.py"
+mkdir -p "$BIN_DIR"
+chmod +x "$SRC_DIR/mag.py"
+ln -sf "$SRC_DIR/mag.py" "$BIN_DIR/mag"
 ok "コマンド: $BIN_DIR/mag"
 
 case ":$PATH:" in
@@ -28,50 +49,50 @@ case ":$PATH:" in
   *) warn "$BIN_DIR が PATH にありません。シェル設定に追加してください" ;;
 esac
 
+# データ置き場を先に作る（既存があればそちらが尊重される）
+python3 "$SRC_DIR/mag.py" doctor >/dev/null 2>&1 || true
+
 # ── Claude Code の statusLine 連携 ──────────────────────────────────────
-# 稼働中セッションの利用率を追加のAPIコール無しで拾うために使う
+# 走っているセッションの利用率を、追加のAPIコール無しで拾うために使う
 if [ -d "$HOME/.claude" ]; then
-  if python3 "$REPO_DIR/mag.py" install-statusline >/dev/null 2>&1; then
+  if python3 "$SRC_DIR/mag.py" install-statusline >/dev/null 2>&1; then
     ok "Claude Code の statusLine に連携（既存設定はバックアップ済み）"
   else
-    warn "statusLine の連携に失敗しました。あとで 'mag install-statusline' を実行してください"
+    warn "statusLine 連携に失敗。あとで 'mag install-statusline' を実行してください"
   fi
 fi
 
-# ── シェルラッパー（任意）────────────────────────────────────────────────
-FISH_DIR="$HOME/.config/fish/conf.d"
-if [ -d "$HOME/.config/fish" ]; then
-  read -r -p "claude / codex コマンドを自動切替ラッパー経由にしますか? [y/N] " a
-  if [[ "${a:-N}" =~ ^[Yy]$ ]]; then
-    mkdir -p "$FISH_DIR"
-    cp "$REPO_DIR/shell/magazine.fish" "$FISH_DIR/magazine.fish"
-    ok "fish: $FISH_DIR/magazine.fish（外したいときはこのファイルを消すだけ）"
-  else
-    warn "スキップしました。'mag run -- claude' / 'mag crun -- codex' で個別に使えます"
-  fi
+# 対話できるか（パイプ実行だと stdin が塞がっている）
+if [ -t 0 ]; then ASK=1; else ASK=0; warn "非対話実行なので、任意項目は既定でスキップします"; fi
+confirm() { [ "$ASK" = 1 ] || return 1; read -r -p "$1 [y/N] " a; [[ "${a:-N}" =~ ^[Yy]$ ]]; }
+
+# ── シェル連携（任意）────────────────────────────────────────────────────
+if [ -d "$HOME/.config/fish" ] && confirm "claude / codex の起動前に自動でアカウントを選ぶようにしますか?"; then
+  mkdir -p "$HOME/.config/fish/conf.d"
+  cp "$SRC_DIR/shell/magazine.fish" "$HOME/.config/fish/conf.d/magazine.fish"
+  ok "fish: ~/.config/fish/conf.d/magazine.fish（外すときはこのファイルを消すだけ）"
 fi
 
 # ── 常駐監視（任意）──────────────────────────────────────────────────────
-read -r -p "上限の手前で自動的に弾を送る常駐監視を入れますか? [y/N] " b
-if [[ "${b:-N}" =~ ^[Yy]$ ]]; then
+if confirm "上限の手前で自動的にアカウントを切り替える常駐監視を入れますか?"; then
   mkdir -p "$(dirname "$PLIST")"
-  sed -e "s|__HOME__|$HOME|g" -e "s|__MAG__|$REPO_DIR/mag.py|g" \
-      "$REPO_DIR/launchd/com.magazine.watch.plist.template" > "$PLIST"
+  sed -e "s|__HOME__|$HOME|g" -e "s|__MAG__|$SRC_DIR/mag.py|g" \
+      "$SRC_DIR/launchd/com.magazine.watch.plist.template" > "$PLIST"
   launchctl bootout "gui/$(id -u)" "$PLIST" 2>/dev/null || true
   launchctl bootstrap "gui/$(id -u)" "$PLIST"
-  ok "常駐監視を起動しました（停止: launchctl bootout gui/$(id -u) $PLIST）"
+  ok "常駐監視を起動（停止: launchctl bootout gui/$(id -u) $PLIST）"
 else
-  warn "スキップしました。'mag watch' で手動起動できます"
+  warn "常駐監視なし。'mag watch' で手動起動、または再度 install.sh を実行してください"
 fi
 
 echo
 say "次の手順"
 cat <<'EOS'
   1. 使いたいアカウントにログインして登録する（アカウントの数だけ繰り返す）
-       claude auth login          →  mag add --label main
-       codex login                →  mag add --provider codex --label codex-main
+       claude auth login   →  mag add --label main
+       codex login         →  mag add --provider codex --label codex-main
   2. 残量を一覧する
        mag limits
-  3. 動作確認
+  3. 状態を確認する
        mag doctor
 EOS

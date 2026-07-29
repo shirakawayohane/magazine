@@ -34,6 +34,21 @@ VERSION = "0.1.0"
 HOME = os.path.expanduser("~")
 
 
+def _data_root() -> str:
+    """設定と状態の置き場。
+
+    既に ~/.claude-magazine があるならそれを使い続ける（作り直させない）。
+    新規は ~/.config/magazine。MAGAZINE_HOME で明示指定もできる。
+    """
+    env = os.environ.get("MAGAZINE_HOME")
+    if env:
+        return os.path.expanduser(env)
+    legacy = os.path.join(HOME, ".claude-magazine")
+    if os.path.isdir(legacy):
+        return legacy
+    return os.path.join(HOME, ".config", "magazine")
+
+
 def _detect_lang() -> str:
     """MAGAZINE_LANG > LC_ALL/LC_MESSAGES/LANG の順に見る。既定は英語。"""
     explicit = os.environ.get("MAGAZINE_LANG")
@@ -52,7 +67,7 @@ LANG = _detect_lang()
 def T(en: str, ja: str) -> str:
     """表示文字列。CLI では銃の比喩を使わず、素直な語で書く。"""
     return ja if LANG == "ja" else en
-ROOT = os.path.join(HOME, ".claude-magazine")
+ROOT = _data_root()
 ACCOUNTS_PATH = os.path.join(ROOT, "accounts.json")
 STATE_PATH = os.path.join(ROOT, "state.json")
 CONFIG_PATH = os.path.join(ROOT, "config.json")

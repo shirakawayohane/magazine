@@ -128,16 +128,41 @@ each one was found by testing against live accounts, and each one costs you a us
 
 ## Install
 
-Requires macOS (keychain), Python 3.9+, and `claude` and/or `codex` on your `PATH`.
+**macOS only** — it stores credentials in the login keychain, and there is no equivalent path
+on Linux or Windows yet. Needs Python 3.9+ (the system one is fine) and `claude` and/or `codex`
+on your `PATH`. No other dependencies; the whole thing is one standard-library script.
 
 ```sh
-git clone https://github.com/shirakawayohane/magazine
-cd magazine
-./install.sh
+curl -fsSL https://raw.githubusercontent.com/shirakawayohane/magazine/main/install.sh | bash
 ```
 
-This puts `mag` on your `PATH`, wires the Claude Code statusLine hook (so live usage is
-readable without extra API calls), and optionally installs the `watch` daemon and shell wrappers.
+Or from a clone, which is the same script and lets you read it first:
+
+```sh
+git clone https://github.com/shirakawayohane/magazine && cd magazine && ./install.sh
+```
+
+The installer puts `mag` on your `PATH` and wires the Claude Code statusLine hook, so usage is
+readable without spending extra API calls. It then asks before touching anything else — the
+`watch` daemon and the shell integration are both optional, and piping into `bash` skips both
+rather than deciding for you. Re-run it any time to enable them or to update.
+
+Files land in three places: the source in `~/.local/share/magazine`, the command in
+`~/.local/bin/mag`, and your accounts in `~/.config/magazine` (`MAGAZINE_HOME` overrides it).
+
+### Uninstall
+
+```sh
+rm -rf ~/.local/share/magazine ~/.local/bin/mag ~/.config/magazine
+rm -f ~/.config/fish/conf.d/magazine.fish
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.magazine.watch.plist 2>/dev/null
+rm -f ~/Library/LaunchAgents/com.magazine.watch.plist
+security delete-generic-password -s claude-magazine       2>/dev/null   # per account
+security delete-generic-password -s claude-magazine-codex 2>/dev/null   # per account
+```
+
+Your `claude` / `codex` logins are untouched by any of this — whichever account was active
+stays active.
 
 ## Usage
 
