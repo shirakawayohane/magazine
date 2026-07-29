@@ -1,0 +1,28 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    # macOS 専用のツールだが、テスト自体はキーチェーンにもネットワークにも触れないので
+    # Linux でも走る。両方で回して、うっかり環境に依存していないことを確かめる。
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+        python: ["3.10", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: syntax
+        run: python -m compileall -q mag.py
+      - name: shell syntax
+        run: bash -n install.sh
+      - name: tests
+        run: python -m unittest discover -s tests -v

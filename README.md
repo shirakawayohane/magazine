@@ -126,10 +126,23 @@ each one was found by testing against live accounts, and each one costs you a us
   refreshes that account. `magazine` re-syncs the stored copy whenever it sees the account live,
   and flags a dead one as `要再ログイン` instead of silently chambering a round that 401s.
 
+Each of those is pinned by a test, and each test was checked by deliberately reintroducing the
+bug to confirm the test fails. A test that cannot fail is not protecting anything.
+
+## Tests
+
+```sh
+./tests/run.sh
+```
+
+33 tests, no dependencies, and they never touch the real keychain, your accounts, or the
+network — state goes to a temp `MAGAZINE_HOME` and anything reaching outward is substituted.
+CI runs them on macOS and Linux, on Python 3.10 and 3.13.
+
 ## Install
 
 **macOS only** — it stores credentials in the login keychain, and there is no equivalent path
-on Linux or Windows yet. Needs Python 3.9+ (the system one is fine) and `claude` and/or `codex`
+on Linux or Windows yet. Needs Python 3.10+ (the system one is fine) and `claude` and/or `codex`
 on your `PATH`. No other dependencies; the whole thing is one standard-library script.
 
 ```sh
