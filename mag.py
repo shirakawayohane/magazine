@@ -789,10 +789,15 @@ def find_claude_bin() -> str:
 
 
 def auth_status() -> dict:
-    r = subprocess.run(["claude", "auth", "status", "--json"], capture_output=True, text=True)
+    """`claude auth status` の内容。claude が無い環境では空を返す。
+
+    （この値はプロフィールのキャッシュなので、現用アカウントの判定には使わない）
+    """
     try:
+        r = subprocess.run([find_claude_bin(), "auth", "status", "--json"],
+                           capture_output=True, text=True, timeout=20)
         return json.loads(r.stdout)
-    except json.JSONDecodeError:
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
         return {}
 
 
@@ -2092,15 +2097,19 @@ def cmd_watch(args) -> int:
 
 def cmd_doctor(args) -> int:
     ok = True
-    print("── claude-magazine doctor ──")
+    print(T("-- magazine doctor --", "-- magazine doctor --"))
     cur = current_oauth()
-    print(f"現用 Keychain      : {'OK' if cur else '見つからない'} ({LIVE_SERVICE}/{LIVE_ACCOUNT})")
+    where = (f"keychain {LIVE_SERVICE}/{LIVE_ACCOUNT}" if use_keychain()
+             else claude_creds_file())
+    print(T(f"live credential    : {'OK' if cur else 'not found'}  ({where})",
+            f"現用の認証情報     : {'OK' if cur else '見つからない'}  ({where})"))
     ok &= bool(cur)
-    for prov, title in (("claude", "Claude 弾倉"), ("codex", "Codex 弾倉")):
+    for prov, title in ((("claude", T("Claude accounts", "Claude アカウント")),
+                     ("codex", T("Codex accounts", "Codex アカウント")))):
         accs = accounts_of(prov)
         if not accs:
             continue
-        print(f"{title:<18} : {len(accs)} 発")
+        print(T(f"{title:<18} : {len(accs)}", f"{title:<18} : {len(accs)} 個"))
         for a in accs:
             has = (codex_stored_auth(a["slug"]) if prov == "codex"
                    else stored_oauth(a["slug"])) is not None
