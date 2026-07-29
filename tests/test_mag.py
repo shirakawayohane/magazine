@@ -358,6 +358,92 @@ class NameResolution(Base):
         self.assertIn("no account", err)
 
 
+class FileBackedStore(unittest.TestCase):
+    """キーチェーンが無い環境（Linux / Windows）の保管経路。
+
+    macOS でも同じ経路を通せるよう、キーチェーン判定だけを差し替えて確かめる。
+    """
+
+    def setUp(self):
+        self._orig = mag.use_keychain
+        mag.use_keychain = lambda: False
+        self.dir = tempfile.mkdtemp(prefix="magazine-store-")
+        self._orig_secrets = mag.SECRETS_DIR
+        mag.SECRETS_DIR = os.path.join(self.dir, "secrets")
+
+    def tearDown(self):
+        mag.use_keychain = self._orig
+        mag.SECRETS_DIR = self._orig_secrets
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_round_trip(self):
+        mag.kc_write("svc", "acct", {"claudeAiOauth": {"refreshToken": "r1"}})
+        self.assertEqual(mag.kc_read("svc", "acct")["claudeAiOauth"]["refreshToken"], "r1")
+
+    def test_missing_entry_is_none_not_an_error(self):
+        self.assertIsNone(mag.kc_read("svc", "nope"))
+
+    def test_delete(self):
+        mag.kc_write("svc", "acct", {"x": 1})
+        mag.kc_delete("svc", "acct")
+        self.assertIsNone(mag.kc_read("svc", "acct"))
+
+    def test_secret_file_is_not_world_readable(self):
+        mag.kc_write("svc", "acct", {"x": 1})
+        path = mag._secret_path("svc", "acct")
+        self.assertTrue(os.path.exists(path))
+        if os.name != "nt":   # Windows は POSIX 権限を持たないので ACL 側で絞る
+            self.assertEqual(os.stat(path).st_mode & 0o077, 0,
+                             "本人以外が読める権限で認証情報を置いてはいけない")
+
+    def test_account_names_that_are_not_filename_safe(self):
+        # メール由来の識別子には / や @ が入りうる。パスを踏み外さないこと。
+        mag.kc_write("svc", "a/b@c..d", {"x": 1})
+        path = mag._secret_path("svc", "a/b@c..d")
+        self.assertEqual(os.path.dirname(os.path.abspath(path)),
+                         os.path.abspath(mag.SECRETS_DIR))
+        self.assertEqual(mag.kc_read("svc", "a/b@c..d"), {"x": 1})
+
+
+class LiveSlotOnFileSystems(unittest.TestCase):
+    """キーチェーンが無い環境では Claude Code 自身の .credentials.json を読み書きする。"""
+
+    def setUp(self):
+        self._orig = mag.use_keychain
+        mag.use_keychain = lambda: False
+        self.dir = tempfile.mkdtemp(prefix="magazine-live-")
+        os.environ["CLAUDE_CONFIG_DIR"] = self.dir
+
+    def tearDown(self):
+        mag.use_keychain = self._orig
+        os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_swapping_keeps_the_rest_of_the_file(self):
+        # このファイルには MCP のトークンも同居している。巻き込んで消してはいけない。
+        mag.write_live_creds({"claudeAiOauth": {"accessToken": "sk-ant-old",
+                                                "refreshToken": "r0"},
+                              "mcpOAuth": {"some-server": {"accessToken": "keep"}}})
+        mag.install_oauth({"accessToken": "sk-ant-new", "refreshToken": "r1",
+                           "expiresAt": (time.time() + 9999) * 1000})
+        live = mag.live_creds()
+        self.assertEqual(live["claudeAiOauth"]["accessToken"], "sk-ant-new")
+        self.assertEqual(live["mcpOAuth"]["some-server"]["accessToken"], "keep")
+
+    def test_a_malformed_credential_is_refused(self):
+        mag.write_live_creds({"claudeAiOauth": {"accessToken": "sk-ant-old"}})
+        with self.assertRaises(RuntimeError):
+            mag.install_oauth({"accessToken": "not-a-claude-token"})
+        self.assertEqual(mag.live_creds()["claudeAiOauth"]["accessToken"], "sk-ant-old",
+                         "拒否したなら元の内容が残っていること")
+
+    def test_an_expired_credential_is_refused(self):
+        mag.write_live_creds({"claudeAiOauth": {"accessToken": "sk-ant-old"}})
+        with self.assertRaises(RuntimeError):
+            mag.install_oauth({"accessToken": "sk-ant-x", "refreshToken": "r",
+                               "expiresAt": (time.time() - 60) * 1000})
+
+
 class Helpers(Base):
     def test_slugify(self):
         self.assertEqual(mag.slugify("Mikuto.Matsuo@Example.co.jp"),

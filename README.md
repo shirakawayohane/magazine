@@ -135,18 +135,25 @@ bug to confirm the test fails. A test that cannot fail is not protecting anythin
 ./tests/run.sh
 ```
 
-33 tests, no dependencies, and they never touch the real keychain, your accounts, or the
+41 tests, no dependencies, and they never touch the real keychain, your accounts, or the
 network — state goes to a temp `MAGAZINE_HOME` and anything reaching outward is substituted.
 CI runs them on macOS and Linux, on Python 3.10 and 3.13.
 
 ## Install
 
-**macOS only** — it stores credentials in the login keychain, and there is no equivalent path
-on Linux or Windows yet. Needs Python 3.10+ (the system one is fine) and `claude` and/or `codex`
-on your `PATH`. No other dependencies; the whole thing is one standard-library script.
+Needs Python 3.10+ (the system one is fine) and `claude` and/or `codex` on your `PATH`.
+No other dependencies; the whole thing is one standard-library script.
+
+**macOS / Linux**
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/shirakawayohane/magazine/main/install.sh | bash
+```
+
+**Windows** (PowerShell)
+
+```powershell
+irm https://raw.githubusercontent.com/shirakawayohane/magazine/main/windows/install.ps1 | iex
 ```
 
 Or from a clone, which is the same script and lets you read it first:
@@ -154,6 +161,20 @@ Or from a clone, which is the same script and lets you read it first:
 ```sh
 git clone https://github.com/shirakawayohane/magazine && cd magazine && ./install.sh
 ```
+
+### Where credentials live
+
+macOS keeps them in the login keychain. Linux and Windows have no equivalent that is present
+everywhere, so they go in a `0600` file under your data directory — on Windows the ACL is
+narrowed to your user as well. That is the same protection Claude Code itself gives them:
+outside macOS it stores your login in plain `~/.claude/.credentials.json`, and `magazine`
+reads and writes that same file rather than inventing a second scheme.
+
+| | credential store | daemon |
+| --- | --- | --- |
+| macOS | login keychain | launchd |
+| Linux | `0600` file | systemd user unit |
+| Windows | `0600` file + ACL | Scheduled Task (`windows\register-task.ps1`) |
 
 The installer puts `mag` on your `PATH` and wires the Claude Code statusLine hook, so usage is
 readable without spending extra API calls. It then asks before touching anything else — the
