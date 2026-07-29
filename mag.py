@@ -64,6 +64,27 @@ def _detect_lang() -> str:
 LANG = _detect_lang()
 
 
+def _make_output_safe() -> None:
+    """出力先が扱えない文字で落ちないようにする。
+
+    Windows の既定コンソールは cp932 などになることがあり、✓ や █ を
+    そのまま書くと UnicodeEncodeError で異常終了する。表示が崩れるのは
+    許容できても、表示のせいでコマンドが失敗するのは許容できない。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream and hasattr(stream, "reconfigure"):
+                enc = (getattr(stream, "encoding", "") or "").lower()
+                if enc in ("utf-8", "utf8"):
+                    continue
+                stream.reconfigure(errors="replace")
+        except (OSError, ValueError):
+            pass
+
+
+_make_output_safe()
+
+
 def T(en: str, ja: str) -> str:
     """表示文字列。CLI では銃の比喩を使わず、素直な語で書く。"""
     return ja if LANG == "ja" else en
