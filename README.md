@@ -201,12 +201,16 @@ stays active.
 ## Usage
 
 ```sh
-# register the account you are logged into right now
+# register the account you are logged into right now.
+# the alias is what you type from then on; it must be unique across providers.
 claude auth login          # then:
-mag add --label main
+mag add main
 
 codex login                # then:
-mag add --provider codex --label codex-main
+mag add codex-main --provider codex
+
+# signed in to a registered account again (token expired, reinstalled, ...)?
+mag update main
 
 # look at everything at once
 mag limits
@@ -214,7 +218,8 @@ mag limits --json          # for scripts / status bars
 
 # move around
 mag next                   # advance the clip
-mag use sub                # chamber a specific one (partial names work)
+mag use sub                # chamber a specific one (a unique prefix of the alias is enough)
+mag rename sub work        # change an alias; credentials stay put
 mag status                 # per-account detail
 
 # nothing to do — with the daemon running, just use claude / codex normally.

@@ -836,6 +836,42 @@ def find_account(slug: str) -> dict | None:
     return next((a for a in accounts() if a["slug"] == slug), None)
 
 
+# ── 表示名（alias）────────────────────────────────────────────────────────
+# slug は Keychain / state のキーとして内部でだけ使う。ユーザーが打つのも
+# 画面に出るのも label（alias）と、どのアカウントかを示すメールだけ。
+def display(a: dict | None) -> str:
+    if not a:
+        return "?"
+    return a.get("label") or a["slug"]
+
+
+def label_of(slug: str | None) -> str:
+    return display(find_account(slug)) if slug else "?"
+
+
+def describe(a: dict | None) -> str:
+    """一覧・確認メッセージ用: `alias (email)`。"""
+    if not a:
+        return "?"
+    email = a.get("email")
+    return f"{display(a)} ({email})" if email and email != display(a) else display(a)
+
+
+def label_taken_by(label: str, accs: list, except_slug: str | None = None) -> dict | None:
+    """同じ alias（大文字小文字は区別しない）を持つ別アカウントを返す。"""
+    n = (label or "").strip().lower()
+    return next((a for a in accs
+                 if a["slug"] != except_slug and (a.get("label") or "").strip().lower() == n), None)
+
+
+def label_conflict_error(label: str, accs: list, except_slug: str | None = None) -> str | None:
+    other = label_taken_by(label, accs, except_slug)
+    if not other:
+        return None
+    return T(f"alias '{label}' is already used by {describe(other)} — pick another, or `mag rename` that one first",
+             f"alias '{label}' は {describe(other)} が使用中です — 別名にするか、先に `mag rename` で変えてください")
+
+
 PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
 
 
@@ -1029,29 +1065,30 @@ def is_usable(slug: str, p: dict = None) -> tuple[bool, str]:
 def do_load(slug: str, reason: str = "") -> bool:
     acct = find_account(slug) or {}
     prov = provider_of(acct) if acct else "claude"
+    name = display(acct) if acct else slug
 
     if prov == "codex":
         auth = codex_stored_auth(slug)
         if not auth:
-            print(T(f"✗ {slug}: no stored credential in keychain", f"✗ {slug}: Keychain に認証情報がありません"), file=sys.stderr)
+            print(T(f"✗ {name}: no stored credential in keychain", f"✗ {name}: Keychain に認証情報がありません"), file=sys.stderr)
             return False
         auth = codex_ensure_fresh(slug, auth)
         try:
             codex_install_auth(auth)
         except (RuntimeError, OSError) as e:
-            print(T(f"✗ failed to activate {slug}: {e}", f"✗ {slug} への切り替えに失敗: {e}"), file=sys.stderr)
+            print(T(f"✗ failed to activate {name}: {e}", f"✗ {name} への切り替えに失敗: {e}"), file=sys.stderr)
             log(f"load failed: {slug}: {e}")
             return False
     else:
         oauth = stored_oauth(slug)
         if not oauth:
-            print(T(f"✗ {slug}: no stored credential in keychain", f"✗ {slug}: Keychain に認証情報がありません"), file=sys.stderr)
+            print(T(f"✗ {name}: no stored credential in keychain", f"✗ {name}: Keychain に認証情報がありません"), file=sys.stderr)
             return False
         oauth = ensure_fresh(slug, oauth)
         try:
             install_oauth(oauth)
         except RuntimeError as e:
-            print(T(f"✗ failed to activate {slug}: {e}", f"✗ {slug} への切り替えに失敗: {e}"), file=sys.stderr)
+            print(T(f"✗ failed to activate {name}: {e}", f"✗ {name} への切り替えに失敗: {e}"), file=sys.stderr)
             log(f"load failed: {slug}: {e}")
             return False
 
@@ -1125,31 +1162,36 @@ def cmd_add_codex(args) -> int:
         return 1
 
     ident = codex_identity(auth)
-    slug = args.slug or ("cx-" + slugify(ident["email"]))
+    slug = "cx-" + slugify(ident["email"])
     accs = accounts()
-    existing = next((a for a in accs if a["slug"] == slug), None)
+    if err := already_registered_error(slug, accs) or label_conflict_error(args.alias, accs):
+        print(f"✗ {err}", file=sys.stderr)
+        return 1
+    label = args.alias.strip()
     codex_store_auth(slug, auth)
-    if existing:
-        existing.update({"email": ident["email"], "plan": ident.get("plan"),
-                         "label": args.label or existing.get("label") or ident["email"]})
-        print(T(f"↻ updated: {slug} ({ident['email']} / {ident.get('plan')})",
-                f"↻ 更新: {slug} ({ident['email']} / {ident.get('plan')})"))
-    else:
-        accs.append({
-            "slug": slug,
-            "provider": "codex",
-            "label": args.label or ident["email"],
-            "email": ident["email"],
-            "plan": ident.get("plan"),
-            "account_id": ident.get("account_id"),
-            "added_at": datetime.now().isoformat(timespec="seconds"),
-        })
-        n = len([a for a in accs if provider_of(a) == "codex"])
-        print(T(f"✓ added: {slug} ({ident['email']} / {ident.get('plan')}) — Codex account #{n}",
-                f"✓ 追加: {slug} ({ident['email']} / {ident.get('plan')}) — Codex {n} 個目"))
+    accs.append({
+        "slug": slug,
+        "provider": "codex",
+        "label": label,
+        "email": ident["email"],
+        "plan": ident.get("plan"),
+        "account_id": ident.get("account_id"),
+        "added_at": datetime.now().isoformat(timespec="seconds"),
+    })
+    n = len([a for a in accs if provider_of(a) == "codex"])
+    print(T(f"✓ added: {label} ({ident['email']} / {ident.get('plan')}) — Codex account #{n}",
+            f"✓ 追加: {label} ({ident['email']} / {ident.get('plan')}) — Codex {n} 個目"))
     save_accounts(accs)
     set_current("codex", slug)
     return 0
+
+
+def already_registered_error(slug: str, accs: list) -> str | None:
+    hit = next((a for a in accs if a["slug"] == slug), None)
+    if not hit:
+        return None
+    return T(f"this account is already registered as {describe(hit)} — to re-store its credentials run `mag update {display(hit)}`",
+             f"このアカウントは {describe(hit)} として登録済みです — 認証情報を入れ直すなら `mag update {display(hit)}`")
 
 
 def cmd_add(args) -> int:
@@ -1162,42 +1204,125 @@ def cmd_add(args) -> int:
                 "✗ 現在ログイン中のアカウントが見つかりません。まず `claude auth login` を実行してください。"),
               file=sys.stderr)
         return 1
-    st = auth_status()
-    email = st.get("email") or "unknown"
-    slug = args.slug or slugify(email)
+    email = live_claude_email(oauth)
+    slug = slugify(email)
     accs = accounts()
-    existing = next((a for a in accs if a["slug"] == slug), None)
+    if err := already_registered_error(slug, accs) or label_conflict_error(args.alias, accs):
+        print(f"✗ {err}", file=sys.stderr)
+        return 1
+    label = args.alias.strip()
     store_oauth(slug, oauth)
-    if existing:
-        existing["email"] = email
-        existing["label"] = args.label or existing.get("label") or email
-        print(T(f"↻ updated: {slug} ({email})", f"↻ 更新: {slug} ({email})"))
-    else:
-        accs.append({
-            "slug": slug,
-            "label": args.label or email,
-            "email": email,
-            "subscription": oauth.get("subscriptionType"),
-            "tier": oauth.get("rateLimitTier"),
-            "added_at": datetime.now().isoformat(timespec="seconds"),
-        })
-        print(T(f"✓ added: {slug} ({email}) — account #{len(accs)}",
-                f"✓ 追加: {slug} ({email}) — {len(accs)} 個目"))
+    accs.append({
+        "slug": slug,
+        "label": label,
+        "email": email,
+        "subscription": oauth.get("subscriptionType"),
+        "tier": oauth.get("rateLimitTier"),
+        "added_at": datetime.now().isoformat(timespec="seconds"),
+    })
+    print(T(f"✓ added: {label} ({email}) — account #{len(accs)}",
+            f"✓ 追加: {label} ({email}) — {len(accs)} 個目"))
     save_accounts(accs)
-    s = state()
-    s["current"] = slug
-    save_state(s)
+    set_current("claude", slug)
+    return 0
+
+
+def live_claude_email(oauth: dict) -> str:
+    """今ログイン中の Claude アカウントのメール。
+
+    `claude auth status` はプロフィールをキャッシュしていて、Keychain を
+    差し替えた直後は前のアカウントを表示することがある。トークンから直接
+    引ける場合はそちらを信じる。
+    """
+    return (identify_claude_token(oauth.get("accessToken") or "")
+            or auth_status().get("email") or "unknown")
+
+
+def cmd_update(args) -> int:
+    """登録済みアカウントの認証情報を、今ログイン中のものに入れ直す。
+
+    別アカウントでログインしたまま呼ぶと、その alias の保管庫を上書きして
+    しまうので、メールが一致するときだけ通す。
+    """
+    acct, err = resolve_account(args.alias)
+    if not acct:
+        print(f"✗ {err}", file=sys.stderr)
+        return 1
+    prov, slug = provider_of(acct), acct["slug"]
+    if prov == "codex":
+        auth = codex_live_auth()
+        if not auth or not (auth.get("tokens") or {}).get("refresh_token"):
+            print(T("✗ Not signed in to codex. Run `codex login` first.",
+                    "✗ codex にログインしていません。先に `codex login` を実行してください。"), file=sys.stderr)
+            return 1
+        ident = codex_identity(auth)
+        live_email = ident["email"]
+    else:
+        oauth = current_oauth()
+        if not oauth:
+            print(T("✗ No account is currently signed in. Run `claude auth login` first.",
+                    "✗ 現在ログイン中のアカウントが見つかりません。まず `claude auth login` を実行してください。"),
+                  file=sys.stderr)
+            return 1
+        # ここはキャッシュ（auth_status）に頼らない。確認できなければ何も書かない。
+        live_email = identify_claude_token(oauth.get("accessToken") or "")
+        if not live_email:
+            print(T(f"✗ could not verify who is signed in (network?) — leaving {display(acct)} untouched",
+                    f"✗ ログイン中のアカウントを確認できません（ネットワーク?）— {display(acct)} には触りません"),
+                  file=sys.stderr)
+            return 1
+    if (acct.get("email") or "").lower() != (live_email or "").lower():
+        print(T(f"✗ signed in as {live_email}, but {display(acct)} is {acct.get('email')} — sign in as that account first",
+                f"✗ 今のログインは {live_email} ですが、{display(acct)} は {acct.get('email')} です — そのアカウントでログインし直してください"),
+              file=sys.stderr)
+        return 1
+    accs = accounts()
+    me = next(a for a in accs if a["slug"] == slug)
+    if prov == "codex":
+        codex_store_auth(slug, auth)
+        me.update({"plan": ident.get("plan"), "account_id": ident.get("account_id")})
+    else:
+        store_oauth(slug, oauth)
+        me.update({"subscription": oauth.get("subscriptionType"), "tier": oauth.get("rateLimitTier")})
+    save_accounts(accs)
+    set_current(prov, slug)
+    print(T(f"↻ updated credentials: {describe(acct)}", f"↻ 認証情報を入れ直しました: {describe(acct)}"))
     return 0
 
 
 def cmd_remove(args) -> int:
-    accs = [a for a in accounts() if a["slug"] != args.slug]
-    if len(accs) == len(accounts()):
-        print(T(f"✗ {args.slug} is not registered", f"✗ {args.slug} は登録されていません"), file=sys.stderr)
+    acct, err = resolve_account(args.name)
+    if not acct:
+        print(f"✗ {err}", file=sys.stderr)
         return 1
+    slug = acct["slug"]
+    save_accounts([a for a in accounts() if a["slug"] != slug])
+    kc_delete(CODEX_MAG_SERVICE if provider_of(acct) == "codex" else MAG_SERVICE, slug)
+    print(T(f"✓ removed: {describe(acct)}", f"✓ 削除: {describe(acct)}"))
+    return 0
+
+
+def cmd_rename(args) -> int:
+    """alias を付け替える。slug（内部キー）は動かさないので認証情報はそのまま。"""
+    acct, err = resolve_account(args.name)
+    if not acct:
+        print(f"✗ {err}", file=sys.stderr)
+        return 1
+    new = args.new_name.strip()
+    if not new:
+        print(T("✗ new alias is empty", "✗ 新しい alias が空です"), file=sys.stderr)
+        return 1
+    accs = accounts()
+    if err := label_conflict_error(new, accs, acct["slug"]):
+        print(f"✗ {err}", file=sys.stderr)
+        return 1
+    old = display(acct)
+    for a in accs:
+        if a["slug"] == acct["slug"]:
+            a["label"] = new
     save_accounts(accs)
-    kc_delete(MAG_SERVICE, args.slug)
-    print(T(f"✓ removed: {args.slug}", f"✓ 削除: {args.slug}"))
+    print(T(f"✓ renamed: {old} → {new} ({acct.get('email', '?')})",
+            f"✓ 改名: {old} → {new} ({acct.get('email', '?')})"))
     return 0
 
 
@@ -1211,7 +1336,8 @@ def bar(pct) -> str:
 def cmd_status(args) -> int:
     clear_expired_cooldowns()
     for prov, slug in (reconcile_current() or {}).items():
-        print(f"（{prov} の現在弾を実態に合わせて {slug} に修正しました）")
+        print(T(f"(corrected the active {prov} account to {label_of(slug)} to match reality)",
+                f"（{prov} の現在弾を実態に合わせて {label_of(slug)} に修正しました）"))
     if not accounts():
         print(T("No accounts registered. Add one with `mag add`.",
               "アカウントが未登録です。`mag add` で登録してください。"))
@@ -1221,8 +1347,9 @@ def cmd_status(args) -> int:
         accs = accounts_of(prov)
         if not accs:
             continue
-        print(T(f"━━ {title} ━━  {len(accs)} account(s)   active: {get_current(prov) or '(none)'}",
-                f"━━ {title} ━━  {len(accs)} 個   使用中: {get_current(prov) or '(なし)'}"))
+        cur = get_current(prov)
+        print(T(f"━━ {title} ━━  {len(accs)} account(s)   active: {label_of(cur) if cur else '(none)'}",
+                f"━━ {title} ━━  {len(accs)} 個   使用中: {label_of(cur) if cur else '(なし)'}"))
         rc |= _print_magazine(accs, prov, args)
         print()
     return rc
@@ -1233,7 +1360,7 @@ def _print_magazine(accs: list, prov: str, args) -> int:
     for a in accs:
         slug = a["slug"]
         mark = "▶" if slug == cur else " "
-        line = f"{mark} {a.get('label', slug)}  [{slug}]"
+        line = f"{mark} {display(a)}  \033[2m{a.get('email') or ''}\033[0m"
         if args.quick or prov == "codex":
             left = cooldown_left(slug)
             extra = a.get("plan")
@@ -1441,30 +1568,57 @@ def cmd_limits(args) -> int:
 
 
 def resolve_account(needle: str) -> tuple[dict | None, str]:
-    """スラグ・ラベル・メールの部分一致でアカウントを引く。"""
+    """alias（label）でアカウントを引く。
+
+    優先順: alias 完全一致 → slug 完全一致（内部キー、通常は打たない）
+            → alias の前方一致が1件 → alias/メールの部分一致が1件。
+    `main` と `codex-main` が両方あっても `main` は前方一致で `main` に決まる。
+    """
     accs = accounts()
-    exact = next((a for a in accs if a["slug"] == needle), None)
-    if exact:
-        return exact, ""
-    n = needle.lower()
-    hits = [a for a in accs
-            if n in a["slug"].lower()
-            or n in (a.get("label") or "").lower()
-            or n in (a.get("email") or "").lower()]
+    n = (needle or "").strip().lower()
+    if not n:
+        return None, T("account name is empty", "アカウント名が空です")
+
+    def lab(a):
+        return (a.get("label") or "").strip().lower()
+
+    exact = [a for a in accs if lab(a) == n]
+    if len(exact) == 1:
+        return exact[0], ""
+    if len(exact) > 1:
+        # 旧データで alias が重複している。slug でしか区別できないので、ここだけ出す。
+        names = ", ".join(f"{display(a)} [{a['slug']}]" for a in exact)
+        return None, T(f"alias '{needle}' is duplicated: {names} — fix with `mag rename <slug> NEW`",
+                       f"alias '{needle}' が重複しています: {names} — `mag rename <slug> 新名` で直してください")
+    by_slug = next((a for a in accs if a["slug"] == needle), None)
+    if by_slug:
+        return by_slug, ""
+    prefix = [a for a in accs if lab(a).startswith(n)]
+    if len(prefix) == 1:
+        return prefix[0], ""
+    hits = prefix or [a for a in accs
+                      if n in lab(a) or n in (a.get("email") or "").lower()]
     if len(hits) == 1:
         return hits[0], ""
     if not hits:
         return None, T(f"no account matches '{needle}'", f"'{needle}' に一致するアカウントがありません")
-    names = ", ".join(a["slug"] for a in hits)
+    names = ", ".join(describe(a) for a in hits)
     return None, T(f"'{needle}' matches several: {names}", f"'{needle}' が複数に一致します: {names}")
 
 
 def cmd_load(args) -> int:
-    acct, err = resolve_account(args.slug)
+    acct, err = resolve_account(args.alias)
     if not acct:
         print(f"✗ {err}", file=sys.stderr)
         return 1
-    return 0 if do_load(acct["slug"], "manual") else 1
+    prov = provider_of(acct)
+    if get_current(prov) == acct["slug"]:
+        print(T(f"= already active: {describe(acct)}", f"= すでに使用中: {describe(acct)}"))
+        return 0
+    if not do_load(acct["slug"], "manual"):
+        return 1
+    print(T(f"🔁 switched to: {describe(acct)}", f"🔁 切り替え: {describe(acct)}"))
+    return 0
 
 
 def cmd_next(args) -> int:
@@ -1474,20 +1628,19 @@ def cmd_next(args) -> int:
     if not slug:
         print(T(f"✗ No usable {prov} account left.", f"✗ 使える {prov} アカウントがありません。"), file=sys.stderr)
         for s_, why in report:
-            print(f"   - {s_}: {why}", file=sys.stderr)
+            print(f"   - {label_of(s_)}: {why}", file=sys.stderr)
         bslug, when = soonest_reset()
         if bslug:
-            print(T(f"   earliest recovery: {bslug} → {fmt_when(when)}",
-                  f"   最短の復帰: {bslug} → {fmt_when(when)}"), file=sys.stderr)
+            print(T(f"   earliest recovery: {label_of(bslug)} → {fmt_when(when)}",
+                  f"   最短の復帰: {label_of(bslug)} → {fmt_when(when)}"), file=sys.stderr)
         return 2
     if slug == cur:
-        print(T(f"= keeping: {slug}", f"= そのまま使用: {slug}"))
+        print(T(f"= keeping: {label_of(slug)}", f"= そのまま使用: {label_of(slug)}"))
         return 0
     ok = do_load(slug, "next")
     if ok:
-        acct = find_account(slug) or {}
-        print(T(f"🔁 switched to: {acct.get('label', slug)} [{slug}]",
-                f"🔁 切り替え: {acct.get('label', slug)} [{slug}]"))
+        acct = find_account(slug)
+        print(T(f"🔁 switched to: {describe(acct)}", f"🔁 切り替え: {describe(acct)}"))
     return 0 if ok else 1
 
 
@@ -1509,10 +1662,10 @@ def cmd_auto(args) -> int:
         if ok:
             if args.verbose:
                 pct = ((p or {}).get("five_hour") or {}).get("pct")
-                print(T(f"[magazine] {cur}: 5h {pct if pct is not None else '?'}% — keeping",
-                      f"[magazine] {cur}: 5h {pct if pct is not None else '?'}% — そのまま"))
+                print(T(f"[magazine] {label_of(cur)}: 5h {pct if pct is not None else '?'}% — keeping",
+                      f"[magazine] {label_of(cur)}: 5h {pct if pct is not None else '?'}% — そのまま"))
             return 0
-        print(T(f"[magazine] {cur} is out ({why})", f"[magazine] {cur} 上限到達 ({why})"))
+        print(T(f"[magazine] {label_of(cur)} is out ({why})", f"[magazine] {label_of(cur)} 上限到達 ({why})"))
     rc = cmd_next(argparse.Namespace(no_probe=args.no_probe, provider=prov))
     if rc == 2 and not getattr(args, "strict", False):
         # 起動前の判定はまだ「上限確定」ではない。残りを使い切らせるため現弾のまま起動する。
@@ -1524,7 +1677,14 @@ def cmd_auto(args) -> int:
 
 def cmd_hit(args) -> int:
     """上限ヒットを手動で記録して次弾へ。"""
-    cur = args.slug or get_current("claude")
+    if args.alias:
+        acct, err = resolve_account(args.alias)
+        if not acct:
+            print(f"✗ {err}", file=sys.stderr)
+            return 1
+        cur = acct["slug"]
+    else:
+        cur = get_current("claude")
     if not cur:
         print(T("✗ Cannot tell which account is active", "✗ 現在使用中のアカウントが不明です"), file=sys.stderr)
         return 1
@@ -1542,8 +1702,8 @@ def cmd_hit(args) -> int:
             kind = kind or cand[0][1]
             resets = cand[0][2]
     set_cooldown(cur, kind, resets)
-    print(T(f"⛔ marked as limited: {cur} ({kind or 'five_hour'})",
-            f"⛔ 上限到達として記録: {cur} ({kind or 'five_hour'})"))
+    print(T(f"⛔ marked as limited: {label_of(cur)} ({kind or 'five_hour'})",
+            f"⛔ 上限到達として記録: {label_of(cur)} ({kind or 'five_hour'})"))
     return cmd_next(argparse.Namespace(no_probe=False))
 
 
@@ -1582,6 +1742,9 @@ def cmd_statusline(args) -> int:
         parts.append(f"5h:{five:.0f}%")
     if seven is not None:
         parts.append(f"7d:{seven:.0f}%")
+    effort = ((data.get("effort") or {}).get("level"))
+    if effort:
+        parts.append(f"effort:{effort}")
     accs = accounts()
     if accs and cur:
         slugs = [a["slug"] for a in accs]
@@ -2149,8 +2312,17 @@ def cmd_doctor(args) -> int:
             has = (codex_stored_auth(a["slug"]) if prov == "codex"
                    else stored_oauth(a["slug"])) is not None
             mark = "OK" if has else T("credential missing", "認証情報なし")
-            print(f"  - {a['slug']:<32} {mark}")
+            print(f"  - {describe(a):<40} {mark}")
             ok &= has
+    dups = {}
+    for a in accounts():
+        dups.setdefault((a.get("label") or "").strip().lower(), []).append(a)
+    for group in (g for g in dups.values() if len(g) > 1):
+        ok = False
+        print(T(f"⚠ duplicate alias '{display(group[0])}' — give each a unique name:",
+                f"⚠ alias '{display(group[0])}' が重複しています — それぞれ別名にしてください:"))
+        for a in group:
+            print(f"    mag rename {a['slug']} <new-alias>    # {a.get('email', '?')} / {provider_of(a)}")
     # `claude auth status` はプロフィールをキャッシュしており Keychain の差し替えに
     # 追従しない（別アカウントを表示し続ける）。実際に入っている弾は
     # refreshToken の一致で判定する。
@@ -2159,8 +2331,8 @@ def cmd_doctor(args) -> int:
     real = next((a for a in accounts_of("claude")
                  if (stored_oauth(a["slug"]) or {}).get("refreshToken") == live_rt), None)
     name = real.get("label") if real else T("an unregistered account", "未登録のアカウント")
-    print(T(f"active Claude acct : {name} [{real['slug'] if real else '?'}]",
-            f"実際の Claude 現用 : {name} [{real['slug'] if real else '?'}]"))
+    print(T(f"active Claude acct : {describe(real) if real else name}",
+            f"実際の Claude 現用 : {describe(real) if real else name}"))
     st = auth_status()
     if real and st.get("email") and st["email"] != real.get("email"):
         print(f"  ※ `claude auth status` は {st['email']} と表示しますが、"
@@ -2187,7 +2359,7 @@ def cmd_doctor(args) -> int:
         print(T("pre-checked next   :", "次の候補の事前検証 :"))
         for slug, w in warm.items():
             mark = "OK" if w.get("ok") else f"NG ({w.get('msg', '')[:40]})"
-            print(f"  - {slug:<32} {mark}")
+            print(f"  - {label_of(slug):<32} {mark}")
     print(T(f"log                : {LOG_PATH}", f"ログ               : {LOG_PATH}"))
     return 0 if ok else 1
 
@@ -2247,37 +2419,50 @@ def main() -> int:
         epilog=T("""Common flow:
   mag limits                     usage for every account
   mag next                       switch to the next account
-  mag use sub                    switch to a specific one (partial name ok)
+  mag use sub                    switch to one by alias (a unique prefix is enough)
+  mag rename sub work            change an alias
   mag stalled                    find sessions stopped by a limit
   mag resume <session-id>        resume one (an interrupted workflow continues)
 
-Registering:
-  claude auth login  ->  mag add --label main
-  codex login        ->  mag add --provider codex --label codex-main
+Registering (the alias is what you type from then on):
+  claude auth login  ->  mag add main
+  codex login        ->  mag add codex-main --provider codex
+  signed in again?   ->  mag update main
 """, """よく使う流れ:
   mag limits                     全アカウントの残量を一覧
   mag next                       次のアカウントに切り替え
-  mag use sub                    指定アカウントに切り替え（部分一致可）
+  mag use sub                    alias で切り替え（一意に決まる先頭数文字で可）
+  mag rename sub work            alias を変更
   mag stalled                    上限で止まったセッションを探す
   mag resume <session-id>        再開（中断した workflow は続きから）
 
-登録:
-  claude auth login  ->  mag add --label main
-  codex login        ->  mag add --provider codex --label codex-main
+登録（alias が以後打つ名前になる）:
+  claude auth login  ->  mag add main
+  codex login        ->  mag add codex-main --provider codex
+  ログインし直した   ->  mag update main
 """),
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--version", action="version", version=f"magazine {VERSION}")
     sub = p.add_subparsers(dest="cmd", required=True, metavar="COMMAND")
 
-    a = sub.add_parser("add", help=T("register the account you are signed in to now","現在ログイン中のアカウントを登録"))
-    a.add_argument("--label"); a.add_argument("--slug")
+    a = sub.add_parser("add", help=T("register the account you are signed in to now, under an alias","現在ログイン中のアカウントを alias を付けて登録"))
+    a.add_argument("alias", metavar="ALIAS",
+                   help=T("short unique name you will type to switch", "切り替え時に打つ短い一意な名前"))
     a.add_argument("--provider", choices=["claude", "codex"], default="claude",
                    help=T("use codex to register a ChatGPT (codex CLI) account","codex を指定すると ChatGPT (codex CLI) 側に登録"))
     a.set_defaults(func=cmd_add)
 
+    a = sub.add_parser("update", help=T("re-store a registered account's credentials from the current sign-in",
+                                        "登録済みアカウントの認証情報を今のログインで入れ直す"))
+    a.add_argument("alias", metavar="ALIAS"); a.set_defaults(func=cmd_update)
 
-    a = sub.add_parser("remove", help=T("remove an account","アカウントを削除"))
-    a.add_argument("slug"); a.set_defaults(func=cmd_remove)
+
+    a = sub.add_parser("remove", aliases=["rm"], help=T("remove an account","アカウントを削除"))
+    a.add_argument("name", metavar="ALIAS"); a.set_defaults(func=cmd_remove)
+
+    a = sub.add_parser("rename", aliases=["mv"], help=T("change an account's alias","アカウントの alias を変更"))
+    a.add_argument("name", metavar="ALIAS"); a.add_argument("new_name", metavar="NEW_ALIAS")
+    a.set_defaults(func=cmd_rename)
 
     a = sub.add_parser("status", aliases=["st"], help=T("per-account detail","アカウントごとの詳細"))
     a.add_argument("--quick", action="store_true", help="API を叩かず cooldown だけ表示")
@@ -2292,8 +2477,8 @@ Registering:
                           "装填していない Codex も実測する（1アカウントにつき1リクエスト消費）"))
     a.set_defaults(func=cmd_limits)
 
-    a = sub.add_parser("load", aliases=["use"], help=T("switch to an account (partial name ok)","指定アカウントに切り替え（部分一致可）"))
-    a.add_argument("slug", metavar="NAME"); a.set_defaults(func=cmd_load)
+    a = sub.add_parser("load", aliases=["use"], help=T("switch to an account by alias (unique prefix ok)","alias でアカウントに切り替え（一意な先頭文字列で可）"))
+    a.add_argument("alias", metavar="ALIAS"); a.set_defaults(func=cmd_load)
 
     a = sub.add_parser("next", help=T("advance to the next account","次のアカウントに切り替え"))
     a.add_argument("--no-probe", action="store_true")
@@ -2309,7 +2494,9 @@ Registering:
     a.set_defaults(func=cmd_auto)
 
     a = sub.add_parser("hit", help=T("record a limit hit and move on","上限到達を記録して次へ"))
-    a.add_argument("--kind", choices=["five_hour", "seven_day"]); a.add_argument("--slug")
+    a.add_argument("--kind", choices=["five_hour", "seven_day"])
+    a.add_argument("--account", "--slug", dest="alias", metavar="ALIAS",
+                   help=T("which account (default: the active one)", "対象アカウント（省略時は使用中のもの）"))
     a.set_defaults(func=cmd_hit)
 
 

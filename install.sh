@@ -117,8 +117,8 @@ echo
 say "次の手順"
 cat <<'EOS'
   1. 使いたいアカウントにログインして登録する（アカウントの数だけ繰り返す）
-       claude auth login   →  mag add --label main
-       codex login         →  mag add --provider codex --label codex-main
+       claude auth login   →  mag add main
+       codex login         →  mag add codex-main --provider codex
   2. 残量を一覧する
        mag limits
   3. 状態を確認する

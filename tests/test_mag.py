@@ -13,6 +13,7 @@
 """
 import importlib.util
 import json
+import argparse
 import os
 import shutil
 import sys
@@ -330,32 +331,145 @@ class StateHandling(Base):
 
 
 class NameResolution(Base):
+    """ユーザーが打つのは alias だけ。slug（内部キー）を要求しない。"""
+
     def setUp(self):
         super().setUp()
         self.add_account("mikuto-matsuo-example-co-jp", email="mikuto@example.co.jp",
                          label="main")
         self.add_account("hanoruru-stream-example-com", email="hanoruru@example.com",
                          label="sub")
+        # 同じ人の Codex 側。メールも slug も claude 側と被る（実際に起きた形）
+        self.add_account("cx-mikuto-matsuo-example-co-jp", provider="codex",
+                         email="mikuto@example.co.jp", label="codex-main")
 
-    def test_exact_slug(self):
+    def test_exact_alias_wins_even_if_it_is_a_substring_of_another(self):
+        acct, err = mag.resolve_account("main")
+        self.assertIsNotNone(acct, err)
+        self.assertEqual(acct["label"], "main", "codex-main に引っ張られない")
+
+    def test_alias_is_case_insensitive(self):
+        self.assertEqual(mag.resolve_account("MAIN")[0]["label"], "main")
+
+    def test_unique_prefix_of_alias(self):
+        self.assertEqual(mag.resolve_account("su")[0]["label"], "sub")
+        self.assertEqual(mag.resolve_account("codex")[0]["label"], "codex-main")
+
+    def test_slug_still_works_as_hidden_escape_hatch(self):
         acct, err = mag.resolve_account("hanoruru-stream-example-com")
         self.assertEqual(acct["label"], "sub", err)
 
-    def test_partial_and_label_and_email(self):
-        for needle in ("hanoruru", "sub", "hanoruru@example.com"):
+    def test_email_substring_when_unique(self):
+        for needle in ("hanoruru", "hanoruru@example.com"):
             acct, err = mag.resolve_account(needle)
             self.assertIsNotNone(acct, f"{needle}: {err}")
             self.assertEqual(acct["label"], "sub")
 
-    def test_ambiguous_input_is_refused_rather_than_guessed(self):
+    def test_ambiguous_input_is_refused_and_lists_aliases_not_slugs(self):
         acct, err = mag.resolve_account("example")
         self.assertIsNone(acct, "曖昧なまま勝手に選ばない")
         self.assertIn("matches several", err)
+        self.assertIn("main (mikuto@example.co.jp)", err)
+        self.assertNotIn("mikuto-matsuo-example-co-jp", err, "長い識別子は見せない")
+
+    def test_duplicate_aliases_in_legacy_data_point_to_rename(self):
+        accs = mag.accounts()
+        accs[2]["label"] = "main"
+        mag.save_accounts(accs)
+        acct, err = mag.resolve_account("main")
+        self.assertIsNone(acct)
+        self.assertIn("duplicated", err)
+        self.assertIn("mag rename", err)
+        self.assertIn("cx-mikuto-matsuo-example-co-jp", err, "重複時だけは slug が唯一の区別手段")
 
     def test_unknown_input(self):
         acct, err = mag.resolve_account("nope")
         self.assertIsNone(acct)
         self.assertIn("no account", err)
+
+
+class AliasManagement(Base):
+    """alias は全 provider を通して一意。付け替えは rename で、認証情報は動かない。"""
+
+    def setUp(self):
+        super().setUp()
+        self.add_account("a-slug", email="a@example.com", label="main")
+        self.add_account("cx-a-slug", provider="codex", email="a@example.com", label="codex-main")
+        mag.kc_write(mag.MAG_SERVICE, "a-slug", {"claudeAiOauth": {"refreshToken": "r-a"}})
+        mag.kc_write(mag.CODEX_MAG_SERVICE, "cx-a-slug", {"tokens": {"refresh_token": "r-cx"}})
+
+    def _sign_in_as(self, email, refresh="r-new"):
+        self.patch("current_oauth", lambda: {"refreshToken": refresh, "accessToken": "a", "subscriptionType": "max"})
+        self.patch("identify_claude_token", lambda tok: email)
+        self.patch("auth_status", lambda: {"email": "stale@example.com"})  # キャッシュは信じない
+
+    def test_add_takes_the_alias_as_a_positional_argument(self):
+        self._sign_in_as("b@example.com")
+        rc = mag.cmd_add(argparse.Namespace(provider="claude", alias="sub"))
+        self.assertEqual(rc, 0)
+        self.assertEqual(mag.resolve_account("sub")[0]["email"], "b@example.com")
+        self.assertEqual(mag.get_current("claude"), "b-example-com")
+
+    def test_add_refuses_a_taken_alias(self):
+        self._sign_in_as("b@example.com")
+        rc = mag.cmd_add(argparse.Namespace(provider="claude", alias="MAIN"))
+        self.assertEqual(rc, 1)
+        self.assertEqual(len(mag.accounts()), 2)
+
+    def test_add_refuses_an_already_registered_account(self):
+        self._sign_in_as("a@example.com")
+        accs = mag.accounts(); accs[0]["slug"] = "a-example-com"; mag.save_accounts(accs)
+        rc = mag.cmd_add(argparse.Namespace(provider="claude", alias="again"))
+        self.assertEqual(rc, 1, "add は新規専用。入れ直しは update")
+        self.assertEqual(len(mag.accounts()), 2)
+
+    def test_update_re_stores_credentials_when_the_same_person_is_signed_in(self):
+        self._sign_in_as("a@example.com", refresh="r-rotated")
+        rc = mag.cmd_update(argparse.Namespace(alias="main"))
+        self.assertEqual(rc, 0)
+        self.assertEqual(mag.find_account("a-slug")["label"], "main", "alias は変わらない")
+        self.assertEqual(mag.kc_read(mag.MAG_SERVICE, "a-slug")["claudeAiOauth"]["refreshToken"], "r-rotated")
+
+    def test_update_refuses_when_the_signed_in_account_cannot_be_verified(self):
+        self._sign_in_as("a@example.com", refresh="r-rotated")
+        self.patch("identify_claude_token", lambda tok: None)   # API に届かない
+        rc = mag.cmd_update(argparse.Namespace(alias="main"))
+        self.assertEqual(rc, 1, "auth_status のキャッシュを信じて上書きしない")
+        self.assertEqual(mag.kc_read(mag.MAG_SERVICE, "a-slug")["claudeAiOauth"]["refreshToken"], "r-a")
+
+    def test_update_refuses_when_someone_else_is_signed_in(self):
+        self._sign_in_as("b@example.com", refresh="r-other")
+        rc = mag.cmd_update(argparse.Namespace(alias="main"))
+        self.assertEqual(rc, 1, "他人のトークンで main の保管庫を潰さない")
+        self.assertEqual(mag.kc_read(mag.MAG_SERVICE, "a-slug")["claudeAiOauth"]["refreshToken"], "r-a")
+
+    def test_label_conflict_ignores_case_and_self(self):
+        accs = mag.accounts()
+        self.assertIsNotNone(mag.label_conflict_error("MAIN", accs))
+        self.assertIsNone(mag.label_conflict_error("main", accs, except_slug="a-slug"))
+        self.assertIsNone(mag.label_conflict_error("fresh", accs))
+
+    def test_rename_changes_alias_only(self):
+        rc = mag.cmd_rename(argparse.Namespace(name="main", new_name="work"))
+        self.assertEqual(rc, 0)
+        self.assertEqual(mag.find_account("a-slug")["label"], "work")
+        self.assertEqual(mag.resolve_account("work")[0]["slug"], "a-slug")
+        self.assertIsNotNone(mag.kc_read(mag.MAG_SERVICE, "a-slug"), "認証情報はそのまま")
+
+    def test_rename_refuses_taken_alias(self):
+        rc = mag.cmd_rename(argparse.Namespace(name="main", new_name="Codex-Main"))
+        self.assertEqual(rc, 1)
+        self.assertEqual(mag.find_account("a-slug")["label"], "main")
+
+    def test_remove_by_alias_deletes_the_right_keychain_entry(self):
+        rc = mag.cmd_remove(argparse.Namespace(name="codex-main"))
+        self.assertEqual(rc, 0)
+        self.assertEqual([a["slug"] for a in mag.accounts()], ["a-slug"])
+        self.assertIsNone(mag.kc_read(mag.CODEX_MAG_SERVICE, "cx-a-slug"), "codex 側の保管庫を消す")
+        self.assertIsNotNone(mag.kc_read(mag.MAG_SERVICE, "a-slug"), "claude 側は触らない")
+
+    def test_remove_unknown_alias_fails(self):
+        self.assertEqual(mag.cmd_remove(argparse.Namespace(name="nope")), 1)
 
 
 class FileBackedStore(unittest.TestCase):
