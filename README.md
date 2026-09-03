@@ -209,7 +209,13 @@ mag add main
 codex login                # then:
 mag add codex-main --provider codex
 
-# signed in to a registered account again (token expired, reinstalled, ...)?
+# add more accounts without touching the one you are using: mag runs the
+# CLI's own login in a throwaway profile and keeps only the credential.
+mag login claude sub
+mag login codex codex-sub
+mag login claude main      # an existing alias re-stores that account's credentials
+
+# signed in to a registered account again the normal way (token expired, reinstalled, ...)?
 mag update main
 
 # look at everything at once

@@ -1149,41 +1149,63 @@ def slugify(email: str) -> str:
     return base[:40] or "acct"
 
 
-def cmd_add_codex(args) -> int:
-    """今 codex にログイン中の ChatGPT アカウントを弾倉に登録する。"""
-    auth = codex_live_auth()
-    if not auth or not (auth.get("tokens") or {}).get("refresh_token"):
-        print(T("✗ Not signed in to codex. Run `codex login` first.",
-                "✗ codex にログインしていません。先に `codex login` を実行してください。"), file=sys.stderr)
-        return 1
-    if auth.get("auth_mode") == "apikey" or auth.get("OPENAI_API_KEY"):
-        print(T("✗ This is an API-key login. Only ChatGPT subscription auth is supported.",
-                "✗ APIキー方式のログインです。ChatGPT サブスク認証のみ対象です。"), file=sys.stderr)
-        return 1
+def slug_for(prov: str, email: str) -> str:
+    return ("cx-" if prov == "codex" else "") + slugify(email)
 
-    ident = codex_identity(auth)
-    slug = "cx-" + slugify(ident["email"])
-    accs = accounts()
-    if err := already_registered_error(slug, accs) or label_conflict_error(args.alias, accs):
-        print(f"✗ {err}", file=sys.stderr)
-        return 1
-    label = args.alias.strip()
-    codex_store_auth(slug, auth)
-    accs.append({
-        "slug": slug,
-        "provider": "codex",
-        "label": label,
-        "email": ident["email"],
-        "plan": ident.get("plan"),
-        "account_id": ident.get("account_id"),
-        "added_at": datetime.now().isoformat(timespec="seconds"),
-    })
-    n = len([a for a in accs if provider_of(a) == "codex"])
-    print(T(f"✓ added: {label} ({ident['email']} / {ident.get('plan')}) — Codex account #{n}",
-            f"✓ 追加: {label} ({ident['email']} / {ident.get('plan')}) — Codex {n} 個目"))
+
+def store_credential(prov: str, slug: str, cred: dict) -> None:
+    (codex_store_auth if prov == "codex" else store_oauth)(slug, cred)
+
+
+def refresh_entry(entry: dict, prov: str, cred: dict, ident: dict) -> None:
+    """登録エントリの付随情報（プラン等）を最新のログイン結果で更新する。alias は触らない。"""
+    entry["email"] = ident["email"]
+    if prov == "codex":
+        entry.update({"plan": ident.get("plan"), "account_id": ident.get("account_id")})
+    else:
+        entry.update({"subscription": cred.get("subscriptionType"), "tier": cred.get("rateLimitTier")})
+
+
+def register_new(prov: str, slug: str, alias: str, cred: dict, ident: dict, accs: list) -> dict:
+    """認証情報を保管庫に入れ、alias 付きで台帳に載せる。呼ぶ前に重複検査を済ませておくこと。"""
+    store_credential(prov, slug, cred)
+    entry = {"slug": slug, "provider": prov, "label": alias, "email": ident["email"],
+             "added_at": datetime.now().isoformat(timespec="seconds")}
+    refresh_entry(entry, prov, cred, ident)
+    accs.append(entry)
     save_accounts(accs)
-    set_current("codex", slug)
-    return 0
+    n = len([a for a in accs if provider_of(a) == prov])
+    plan = f" / {ident.get('plan')}" if ident.get("plan") else ""
+    print(T(f"✓ added: {alias} ({ident['email']}{plan}) — {prov} account #{n}",
+            f"✓ 追加: {alias} ({ident['email']}{plan}) — {prov} {n} 個目"))
+    return entry
+
+
+def live_identity(prov: str, strict: bool = False) -> tuple[dict | None, dict | None, str | None]:
+    """今 CLI にログイン中のアカウントの (認証情報, 素性, エラー)。
+
+    strict のときは、トークンから本人確認できない限り成功にしない
+    （`claude auth status` のキャッシュは差し替え直後に前の人を指すことがある）。
+    """
+    if prov == "codex":
+        auth = codex_live_auth()
+        if not auth or not (auth.get("tokens") or {}).get("refresh_token"):
+            return None, None, T("Not signed in to codex. Run `codex login` first.",
+                                 "codex にログインしていません。先に `codex login` を実行してください。")
+        if auth.get("auth_mode") == "apikey" or auth.get("OPENAI_API_KEY"):
+            return None, None, T("This is an API-key login. Only ChatGPT subscription auth is supported.",
+                                 "APIキー方式のログインです。ChatGPT サブスク認証のみ対象です。")
+        return auth, codex_identity(auth), None
+    oauth = current_oauth()
+    if not oauth:
+        return None, None, T("No account is currently signed in. Run `claude auth login` first.",
+                             "現在ログイン中のアカウントが見つかりません。まず `claude auth login` を実行してください。")
+    email = identify_claude_token(oauth.get("accessToken") or "")
+    if not email and strict:
+        return None, None, T("could not verify who is signed in (network?)",
+                             "ログイン中のアカウントを確認できません（ネットワーク?）")
+    email = email or auth_status().get("email") or "unknown"
+    return oauth, {"email": email}, None
 
 
 def already_registered_error(slug: str, accs: list) -> str | None:
@@ -1196,94 +1218,210 @@ def already_registered_error(slug: str, accs: list) -> str | None:
 
 def cmd_add(args) -> int:
     """今ログイン中のアカウントを弾倉に登録する。"""
-    if getattr(args, "provider", "claude") == "codex":
-        return cmd_add_codex(args)
-    oauth = current_oauth()
-    if not oauth:
-        print(T("✗ No account is currently signed in. Run `claude auth login` first.",
-                "✗ 現在ログイン中のアカウントが見つかりません。まず `claude auth login` を実行してください。"),
-              file=sys.stderr)
-        return 1
-    email = live_claude_email(oauth)
-    slug = slugify(email)
-    accs = accounts()
-    if err := already_registered_error(slug, accs) or label_conflict_error(args.alias, accs):
+    prov, alias = getattr(args, "provider", "claude"), args.alias.strip()
+    cred, ident, err = live_identity(prov)
+    if err:
         print(f"✗ {err}", file=sys.stderr)
         return 1
-    label = args.alias.strip()
-    store_oauth(slug, oauth)
-    accs.append({
-        "slug": slug,
-        "label": label,
-        "email": email,
-        "subscription": oauth.get("subscriptionType"),
-        "tier": oauth.get("rateLimitTier"),
-        "added_at": datetime.now().isoformat(timespec="seconds"),
-    })
-    print(T(f"✓ added: {label} ({email}) — account #{len(accs)}",
-            f"✓ 追加: {label} ({email}) — {len(accs)} 個目"))
-    save_accounts(accs)
-    set_current("claude", slug)
+    accs = accounts()
+    slug = slug_for(prov, ident["email"])
+    if err := already_registered_error(slug, accs) or label_conflict_error(alias, accs):
+        print(f"✗ {err}", file=sys.stderr)
+        return 1
+    register_new(prov, slug, alias, cred, ident, accs)
+    set_current(prov, slug)
     return 0
 
 
-def live_claude_email(oauth: dict) -> str:
-    """今ログイン中の Claude アカウントのメール。
+# ── 現用に触れないログイン ──────────────────────────────────────────────
+# claude / codex は保存先を環境変数で切り替えられる。使い捨ての保存先で
+# ログインだけ走らせ、出来た認証情報を保管庫へ移す。走っている
+# セッションが掴んでいる現用の認証には一切書き込まない。
+def confirm(question: str) -> bool:
+    if not sys.stdin.isatty():
+        return False
+    try:
+        return input(f"{question} [y/N] ").strip().lower() in ("y", "yes")
+    except EOFError:
+        return False
 
-    `claude auth status` はプロフィールをキャッシュしていて、Keychain を
-    差し替えた直後は前のアカウントを表示することがある。トークンから直接
-    引ける場合はそちらを信じる。
+
+def isolated_claude_service(config_dir: str) -> str:
+    """CLAUDE_CONFIG_DIR を変えたときに Claude Code が使う Keychain のサービス名。
+
+    本体は `Claude Code-credentials-<sha256(設定ディレクトリ)の先頭8桁>` にする
+    （2.1.259 で確認）。この規則が変わると回収に失敗して明示的にエラーになる。
     """
-    return (identify_claude_token(oauth.get("accessToken") or "")
-            or auth_status().get("email") or "unknown")
+    import hashlib, unicodedata
+    d = unicodedata.normalize("NFC", config_dir)
+    return f"{LIVE_SERVICE}-{hashlib.sha256(d.encode('utf-8')).hexdigest()[:8]}"
+
+
+def claude_keychain_services() -> set:
+    """Keychain にある Claude Code の認証エントリのサービス名一覧（現用は除く）。"""
+    if not use_keychain():
+        return set()
+    try:
+        r = subprocess.run(["security", "dump-keychain"], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    return {m for m in re.findall(r'"svce"<blob>="(' + re.escape(LIVE_SERVICE) + r'-[^"]+)"', r.stdout or "")}
+
+
+def collect_isolated_claude(home: str, env: dict, services_before: set = frozenset()) -> tuple[dict | None, dict | None, str | None]:
+    """使い捨ての設定ディレクトリでのログイン結果を回収し、その保存先は消す。
+
+    まず命名規則どおりのサービス名を読む。外れていたら、ログイン前に無かった
+    エントリを「今のログインが作ったもの」とみなして拾う（規則変更への保険）。
+    """
+    creds = None
+    if use_keychain():
+        svc = isolated_claude_service(home)
+        creds = kc_read(svc, LIVE_ACCOUNT)
+        if creds:
+            kc_delete(svc, LIVE_ACCOUNT)
+        else:
+            new = claude_keychain_services() - set(services_before)
+            if len(new) == 1:
+                svc = new.pop()
+                creds = kc_read(svc, LIVE_ACCOUNT)
+                kc_delete(svc, LIVE_ACCOUNT)
+                log(f"login: Keychain のサービス名が想定と違ったので差分で回収 ({svc})")
+    creds = creds or read_json(os.path.join(home, ".credentials.json"), None) or {}
+    oauth = creds.get("claudeAiOauth")
+    if not oauth or not oauth.get("refreshToken"):
+        return None, None, T("no credential was produced (login cancelled, or Claude Code changed where it stores it)",
+                             "認証情報が得られませんでした（ログイン中止、または Claude Code の保存先が変わった）")
+    email = identify_claude_token(oauth.get("accessToken") or "")
+    if not email:
+        # このキャッシュは今のログインの結果そのものなので信じてよい
+        try:
+            r = subprocess.run([find_claude_bin(), "auth", "status", "--json"],
+                               env=env, capture_output=True, text=True, timeout=20)
+            email = (json.loads(r.stdout) or {}).get("email")
+        except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+            email = None
+    if not email:
+        return None, None, T("could not determine the email of the account you signed in to",
+                             "ログインしたアカウントのメールを特定できませんでした")
+    return oauth, {"email": email}, None
+
+
+def collect_isolated_codex(home: str) -> tuple[dict | None, dict | None, str | None]:
+    auth = read_json(os.path.join(home, "auth.json"), None)
+    if not auth or not (auth.get("tokens") or {}).get("refresh_token"):
+        return None, None, T("no credential was produced (login cancelled?)", "認証情報が得られませんでした（ログイン中止?）")
+    if auth.get("auth_mode") == "apikey" or auth.get("OPENAI_API_KEY"):
+        return None, None, T("This is an API-key login. Only ChatGPT subscription auth is supported.",
+                             "APIキー方式のログインです。ChatGPT サブスク認証のみ対象です。")
+    return auth, codex_identity(auth), None
+
+
+def isolated_login(prov: str) -> tuple[dict | None, dict | None, str | None]:
+    import tempfile, shutil as _sh
+    home = os.path.realpath(tempfile.mkdtemp(prefix=f"mag-login-{prov}-"))
+    env = dict(os.environ)
+    try:
+        if prov == "codex":
+            env["CODEX_HOME"] = home
+            src_cfg = os.path.expanduser("~/.codex/config.toml")
+            if os.path.exists(src_cfg):
+                try:
+                    _sh.copy(src_cfg, os.path.join(home, "config.toml"))
+                except OSError:
+                    pass
+            argv = [find_codex_bin(), "login"]
+        else:
+            env["CLAUDE_CONFIG_DIR"] = home
+            argv = [find_claude_bin(), "auth", "login"]
+            services_before = claude_keychain_services()
+        print(T(f"→ running `{os.path.basename(argv[0])} {' '.join(argv[1:])}` in a throwaway profile; the active account is not touched",
+                f"→ 使い捨てのプロファイルで `{os.path.basename(argv[0])} {' '.join(argv[1:])}` を実行します（使用中の認証には触れません）"))
+        try:
+            r = subprocess.run(argv, env=env)
+        except OSError as e:
+            return None, None, str(e)
+        if r.returncode != 0:
+            return None, None, T(f"login exited with {r.returncode}", f"ログインが終了コード {r.returncode} で終わりました")
+        return (collect_isolated_codex(home) if prov == "codex"
+                else collect_isolated_claude(home, env, services_before))
+    finally:
+        _sh.rmtree(home, ignore_errors=True)
+
+
+def cmd_login(args) -> int:
+    """使用中の認証に触れずに別アカウントでログインし、alias を付けて登録する。"""
+    prov, alias = args.provider, args.alias.strip()
+    if not alias:
+        print(T("✗ alias is empty", "✗ alias が空です"), file=sys.stderr)
+        return 1
+    taken = label_taken_by(alias, accounts())
+    if taken:
+        print(T(f"note: alias '{alias}' is {describe(taken)}. Signing in as that account re-stores its credentials; any other account is refused.",
+                f"注: alias '{alias}' は {describe(taken)} です。同じアカウントでログインすれば認証の入れ直し、別アカウントなら拒否します。"))
+    cred, ident, err = isolated_login(prov)
+    if err:
+        print(f"✗ {err}", file=sys.stderr)
+        return 1
+    accs = accounts()   # ログインの間に変わっているかもしれないので読み直す
+    slug = slug_for(prov, ident["email"])
+    hit = next((a for a in accs if a["slug"] == slug), None)
+    if not hit:
+        if err := label_conflict_error(alias, accs):
+            print(f"✗ {err}", file=sys.stderr)
+            return 1
+        register_new(prov, slug, alias, cred, ident, accs)
+        print(T(f"  the active {prov} account is unchanged — switch with `mag use {alias}`",
+                f"  使用中の {prov} アカウントはそのままです — 切り替えるなら `mag use {alias}`"))
+        return 0
+    # 登録済みのアカウントに再ログインした
+    store_credential(prov, slug, cred)
+    refresh_entry(hit, prov, cred, ident)
+    save_accounts(accs)
+    if display(hit).lower() == alias.lower():
+        print(T(f"↻ updated credentials: {describe(hit)}", f"↻ 認証情報を入れ直しました: {describe(hit)}"))
+        return 0
+    other = label_taken_by(alias, accs, except_slug=slug)
+    if other:
+        print(T(f"↻ updated credentials: {describe(hit)}. alias '{alias}' is already used by {describe(other)}, so the name is unchanged",
+                f"↻ 認証情報を入れ直しました: {describe(hit)}。alias '{alias}' は {describe(other)} が使用中なので名前は変えていません"))
+        return 0
+    if confirm(T(f"this account is already registered as {describe(hit)}. Rename it to '{alias}'?",
+                 f"このアカウントは {describe(hit)} として登録済みです。alias を '{alias}' に変えますか?")):
+        old = display(hit)
+        hit["label"] = alias
+        save_accounts(accs)
+        print(T(f"✓ renamed: {old} → {alias}, credentials updated", f"✓ 改名: {old} → {alias}、認証情報も入れ直しました"))
+    else:
+        print(T(f"↻ updated credentials: {describe(hit)} (alias unchanged; `mag rename` to change it later)",
+                f"↻ 認証情報を入れ直しました: {describe(hit)}（alias はそのまま。変えるなら `mag rename`）"))
+    return 0
 
 
 def cmd_update(args) -> int:
     """登録済みアカウントの認証情報を、今ログイン中のものに入れ直す。
 
     別アカウントでログインしたまま呼ぶと、その alias の保管庫を上書きして
-    しまうので、メールが一致するときだけ通す。
+    しまうので、本人確認が取れてメールが一致するときだけ通す。
     """
     acct, err = resolve_account(args.alias)
     if not acct:
         print(f"✗ {err}", file=sys.stderr)
         return 1
     prov, slug = provider_of(acct), acct["slug"]
-    if prov == "codex":
-        auth = codex_live_auth()
-        if not auth or not (auth.get("tokens") or {}).get("refresh_token"):
-            print(T("✗ Not signed in to codex. Run `codex login` first.",
-                    "✗ codex にログインしていません。先に `codex login` を実行してください。"), file=sys.stderr)
-            return 1
-        ident = codex_identity(auth)
-        live_email = ident["email"]
-    else:
-        oauth = current_oauth()
-        if not oauth:
-            print(T("✗ No account is currently signed in. Run `claude auth login` first.",
-                    "✗ 現在ログイン中のアカウントが見つかりません。まず `claude auth login` を実行してください。"),
-                  file=sys.stderr)
-            return 1
-        # ここはキャッシュ（auth_status）に頼らない。確認できなければ何も書かない。
-        live_email = identify_claude_token(oauth.get("accessToken") or "")
-        if not live_email:
-            print(T(f"✗ could not verify who is signed in (network?) — leaving {display(acct)} untouched",
-                    f"✗ ログイン中のアカウントを確認できません（ネットワーク?）— {display(acct)} には触りません"),
-                  file=sys.stderr)
-            return 1
-    if (acct.get("email") or "").lower() != (live_email or "").lower():
-        print(T(f"✗ signed in as {live_email}, but {display(acct)} is {acct.get('email')} — sign in as that account first",
-                f"✗ 今のログインは {live_email} ですが、{display(acct)} は {acct.get('email')} です — そのアカウントでログインし直してください"),
+    cred, ident, err = live_identity(prov, strict=True)
+    if err:
+        print(T(f"✗ {err} — leaving {display(acct)} untouched", f"✗ {err} — {display(acct)} には触りません"), file=sys.stderr)
+        return 1
+    if (acct.get("email") or "").lower() != (ident["email"] or "").lower():
+        print(T(f"✗ signed in as {ident['email']}, but {display(acct)} is {acct.get('email')} — sign in as that account first",
+                f"✗ 今のログインは {ident['email']} ですが、{display(acct)} は {acct.get('email')} です — そのアカウントでログインし直してください"),
               file=sys.stderr)
         return 1
     accs = accounts()
     me = next(a for a in accs if a["slug"] == slug)
-    if prov == "codex":
-        codex_store_auth(slug, auth)
-        me.update({"plan": ident.get("plan"), "account_id": ident.get("account_id")})
-    else:
-        store_oauth(slug, oauth)
-        me.update({"subscription": oauth.get("subscriptionType"), "tier": oauth.get("rateLimitTier")})
+    store_credential(prov, slug, cred)
+    refresh_entry(me, prov, cred, ident)
     save_accounts(accs)
     set_current(prov, slug)
     print(T(f"↻ updated credentials: {describe(acct)}", f"↻ 認証情報を入れ直しました: {describe(acct)}"))
@@ -2425,7 +2563,9 @@ def main() -> int:
   mag resume <session-id>        resume one (an interrupted workflow continues)
 
 Registering (the alias is what you type from then on):
-  claude auth login  ->  mag add main
+  mag login claude sub           sign in to another account; the active one is untouched
+  mag login codex codex-sub
+  claude auth login  ->  mag add main          register the account you are already signed in to
   codex login        ->  mag add codex-main --provider codex
   signed in again?   ->  mag update main
 """, """よく使う流れ:
@@ -2437,7 +2577,9 @@ Registering (the alias is what you type from then on):
   mag resume <session-id>        再開（中断した workflow は続きから）
 
 登録（alias が以後打つ名前になる）:
-  claude auth login  ->  mag add main
+  mag login claude sub           別アカウントでログインして登録（使用中の認証はそのまま）
+  mag login codex codex-sub
+  claude auth login  ->  mag add main          今ログイン中のアカウントを登録
   codex login        ->  mag add codex-main --provider codex
   ログインし直した   ->  mag update main
 """),
@@ -2451,6 +2593,13 @@ Registering (the alias is what you type from then on):
     a.add_argument("--provider", choices=["claude", "codex"], default="claude",
                    help=T("use codex to register a ChatGPT (codex CLI) account","codex を指定すると ChatGPT (codex CLI) 側に登録"))
     a.set_defaults(func=cmd_add)
+
+    a = sub.add_parser("login", help=T("sign in to another account without touching the active one, and register it",
+                                       "使用中の認証に触れずに別アカウントでログインし、登録する"))
+    a.add_argument("provider", choices=["claude", "codex"])
+    a.add_argument("alias", metavar="ALIAS", help=T("alias for the account (an existing alias re-stores that account's credentials)",
+                                                    "このアカウントの alias（登録済み alias なら認証の入れ直し）"))
+    a.set_defaults(func=cmd_login)
 
     a = sub.add_parser("update", help=T("re-store a registered account's credentials from the current sign-in",
                                         "登録済みアカウントの認証情報を今のログインで入れ直す"))

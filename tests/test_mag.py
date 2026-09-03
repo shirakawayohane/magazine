@@ -388,6 +388,127 @@ class NameResolution(Base):
         self.assertIn("no account", err)
 
 
+class IsolatedLogin(Base):
+    """`mag login`: 現用の認証に触れずに別アカウントを取り込む。"""
+
+    def setUp(self):
+        super().setUp()
+        self.add_account("a-example-com", email="a@example.com", label="main")
+        mag.kc_write(mag.MAG_SERVICE, "a-example-com", {"claudeAiOauth": {"refreshToken": "r-a"}})
+        mag.set_current("claude", "a-example-com")
+        self.live = {"claudeAiOauth": {"refreshToken": "r-live", "accessToken": "sk-ant-live"}}
+        self.patch("live_creds", lambda: self.live)
+        self.patch("write_live_creds", lambda c: self.fail("現用に書いてはいけない"))
+        self.patch("confirm", lambda q: self.fail("聞く必要のない場面で聞いた"))
+
+    def _login_yields(self, email, refresh="r-new"):
+        self.patch("isolated_login", lambda prov: (
+            {"refreshToken": refresh, "accessToken": "sk-ant-new", "subscriptionType": "max"},
+            {"email": email}, None))
+
+    def test_new_account_is_registered_without_switching(self):
+        self._login_yields("b@example.com")
+        rc = mag.cmd_login(argparse.Namespace(provider="claude", alias="sub"))
+        self.assertEqual(rc, 0)
+        self.assertEqual(mag.resolve_account("sub")[0]["email"], "b@example.com")
+        self.assertEqual(mag.kc_read(mag.MAG_SERVICE, "b-example-com")["claudeAiOauth"]["refreshToken"], "r-new")
+        self.assertEqual(mag.get_current("claude"), "a-example-com", "使用中の弾は変わらない")
+        self.assertEqual(self.live["claudeAiOauth"]["refreshToken"], "r-live")
+
+    def test_new_account_with_a_taken_alias_is_refused(self):
+        self._login_yields("b@example.com")
+        rc = mag.cmd_login(argparse.Namespace(provider="claude", alias="main"))
+        self.assertEqual(rc, 1)
+        self.assertEqual(len(mag.accounts()), 1)
+
+    def test_same_alias_re_stores_credentials(self):
+        self._login_yields("a@example.com", refresh="r-rotated")
+        rc = mag.cmd_login(argparse.Namespace(provider="claude", alias="main"))
+        self.assertEqual(rc, 0)
+        self.assertEqual(mag.kc_read(mag.MAG_SERVICE, "a-example-com")["claudeAiOauth"]["refreshToken"], "r-rotated")
+        self.assertEqual(len(mag.accounts()), 1)
+
+    def test_registered_account_under_a_new_alias_asks_before_renaming(self):
+        self._login_yields("a@example.com", refresh="r-rotated")
+        asked = []
+        self.patch("confirm", lambda q: asked.append(q) or True)
+        rc = mag.cmd_login(argparse.Namespace(provider="claude", alias="work"))
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(asked), 1)
+        self.assertEqual(mag.find_account("a-example-com")["label"], "work")
+        self.assertEqual(mag.kc_read(mag.MAG_SERVICE, "a-example-com")["claudeAiOauth"]["refreshToken"], "r-rotated")
+
+    def test_declining_the_rename_keeps_the_alias_but_still_updates_credentials(self):
+        self._login_yields("a@example.com", refresh="r-rotated")
+        self.patch("confirm", lambda q: False)
+        rc = mag.cmd_login(argparse.Namespace(provider="claude", alias="work"))
+        self.assertEqual(rc, 0)
+        self.assertEqual(mag.find_account("a-example-com")["label"], "main")
+        self.assertEqual(mag.kc_read(mag.MAG_SERVICE, "a-example-com")["claudeAiOauth"]["refreshToken"], "r-rotated")
+
+    def test_rename_is_not_offered_when_the_alias_belongs_to_someone_else(self):
+        self.add_account("c-example-com", email="c@example.com", label="work")
+        self._login_yields("a@example.com", refresh="r-rotated")
+        rc = mag.cmd_login(argparse.Namespace(provider="claude", alias="work"))
+        self.assertEqual(rc, 0)
+        self.assertEqual(mag.find_account("a-example-com")["label"], "main")
+        self.assertEqual(mag.find_account("c-example-com")["label"], "work")
+
+    def test_login_failure_changes_nothing(self):
+        self.patch("isolated_login", lambda prov: (None, None, "cancelled"))
+        rc = mag.cmd_login(argparse.Namespace(provider="codex", alias="cx"))
+        self.assertEqual(rc, 1)
+        self.assertEqual(len(mag.accounts()), 1)
+
+    def test_keychain_service_name_follows_claude_code_rule(self):
+        import hashlib
+        home = "/private/tmp/mag-login-claude-xyz"
+        self.assertEqual(mag.isolated_claude_service(home),
+                         "Claude Code-credentials-" + hashlib.sha256(home.encode()).hexdigest()[:8])
+
+    def test_collect_claude_from_the_expected_keychain_entry_and_clean_up(self):
+        self.patch("use_keychain", lambda: True)
+        self.patch("identify_claude_token", lambda tok: "b@example.com")
+        home = "/private/tmp/mag-login-claude-abc"
+        svc = mag.isolated_claude_service(home)
+        mag.kc_write(svc, mag.LIVE_ACCOUNT, {"claudeAiOauth": {"refreshToken": "r-b", "accessToken": "sk-ant-b"}})
+        oauth, ident, err = mag.collect_isolated_claude(home, {})
+        self.assertIsNone(err)
+        self.assertEqual(ident["email"], "b@example.com")
+        self.assertEqual(oauth["refreshToken"], "r-b")
+        self.assertIsNone(mag.kc_read(svc, mag.LIVE_ACCOUNT), "使い捨てのエントリは消す")
+
+    def test_collect_claude_falls_back_to_the_entry_that_appeared_during_login(self):
+        self.patch("use_keychain", lambda: True)
+        self.patch("identify_claude_token", lambda tok: "b@example.com")
+        home = "/private/tmp/mag-login-claude-abc"
+        mag.kc_write("Claude Code-credentials-deadbeef", mag.LIVE_ACCOUNT,
+                     {"claudeAiOauth": {"refreshToken": "r-b", "accessToken": "sk-ant-b"}})
+        self.patch("claude_keychain_services", lambda: {"Claude Code-credentials-deadbeef", "Claude Code-credentials-old"})
+        oauth, ident, err = mag.collect_isolated_claude(home, {}, services_before={"Claude Code-credentials-old"})
+        self.assertIsNone(err)
+        self.assertEqual(oauth["refreshToken"], "r-b")
+        self.assertIsNone(mag.kc_read("Claude Code-credentials-deadbeef", mag.LIVE_ACCOUNT))
+
+    def test_collect_claude_reports_when_nothing_was_produced(self):
+        self.patch("use_keychain", lambda: True)
+        self.patch("claude_keychain_services", lambda: set())
+        oauth, ident, err = mag.collect_isolated_claude("/private/tmp/nothing-here", {})
+        self.assertIsNone(oauth)
+        self.assertIn("no credential", err)
+
+    def test_collect_codex_reads_auth_json(self):
+        home = tempfile.mkdtemp(prefix="mag-test-cx-")
+        self.patch("codex_identity", lambda auth: {"email": "cx@example.com", "plan": "pro", "account_id": "acc"})
+        with open(os.path.join(home, "auth.json"), "w") as f:
+            json.dump({"tokens": {"refresh_token": "r-cx", "access_token": "a"}}, f)
+        auth, ident, err = mag.collect_isolated_codex(home)
+        self.assertIsNone(err)
+        self.assertEqual(ident["email"], "cx@example.com")
+        self.assertEqual(auth["tokens"]["refresh_token"], "r-cx")
+        shutil.rmtree(home, ignore_errors=True)
+
+
 class AliasManagement(Base):
     """alias は全 provider を通して一意。付け替えは rename で、認証情報は動かない。"""
 
