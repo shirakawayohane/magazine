@@ -255,6 +255,11 @@ class CodexUsage(Base):
         self.patch("CODEX_SESSIONS_DIR", self.sessions)
         self.addCleanup(shutil.rmtree, self.sessions, ignore_errors=True)
 
+    @staticmethod
+    def ago(minutes):
+        """相対時刻の ISO 文字列。固定日付にすると 7 日で腐る。"""
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - minutes * 60))
+
     def write_record(self, name, ts, pct, limit_id="codex", window=10080):
         rec = {"timestamp": ts, "type": "event_msg",
                "payload": {"type": "token_count",
@@ -267,27 +272,27 @@ class CodexUsage(Base):
             f.write(json.dumps(rec) + "\n")
 
     def test_reads_the_latest_usage(self):
-        self.write_record("s1.jsonl", "2026-07-27T10:00:00Z", 40.0)
-        self.write_record("s2.jsonl", "2026-07-27T11:00:00Z", 73.0)
+        self.write_record("s1.jsonl", self.ago(120), 40.0)
+        self.write_record("s2.jsonl", self.ago(60), 73.0)
         lim = mag.codex_live_limits()
         self.assertEqual(lim["windows"][0]["pct"], 73.0)
 
     def test_limited_time_model_quota_is_a_separate_budget(self):
         # Spark 等の期間限定枠は limit_id が別。通常枠と混ぜると誤判定になる。
-        self.write_record("normal.jsonl", "2026-07-27T10:00:00Z", 12.0, limit_id="codex")
-        self.write_record("spark.jsonl", "2026-07-27T11:00:00Z", 100.0,
+        self.write_record("normal.jsonl", self.ago(120), 12.0, limit_id="codex")
+        self.write_record("spark.jsonl", self.ago(60), 100.0,
                           limit_id="codex_bengalfox")
         lim = mag.codex_live_limits()
         self.assertEqual(lim["windows"][0]["pct"], 12.0, "別枠の100%を通常枠として読まない")
 
     def test_records_predating_the_swap_are_excluded(self):
-        self.write_record("old.jsonl", "2026-07-27T10:00:00Z", 95.0)
-        cutoff = mag.parse_iso("2026-07-27T12:00:00Z")
+        self.write_record("old.jsonl", self.ago(120), 95.0)
+        cutoff = mag.parse_iso(self.ago(60))
         self.assertIsNone(mag.codex_live_limits(only_after=cutoff),
                           "切り替え前の記録は別アカウントの数値")
 
     def test_window_is_labelled_by_its_length(self):
-        self.write_record("w.jsonl", "2026-07-27T10:00:00Z", 5.0, window=300)   # 5時間
+        self.write_record("w.jsonl", self.ago(60), 5.0, window=300)   # 5時間
         self.assertIn("5", mag.codex_live_limits()["windows"][0]["label"])
 
 
@@ -672,11 +677,114 @@ class LiveSlotOnFileSystems(unittest.TestCase):
         self.assertEqual(mag.live_creds()["claudeAiOauth"]["accessToken"], "sk-ant-old",
                          "拒否したなら元の内容が残っていること")
 
+    def test_the_write_lock_is_taken_and_released(self):
+        lock = mag.storage_lock_path()
+        with mag.live_write_lock() as held:
+            self.assertTrue(held)
+            self.assertTrue(os.path.isdir(lock))
+        self.assertFalse(os.path.exists(lock), "抜けたら必ず外す")
+
+    def test_a_stale_lock_is_taken_over(self):
+        # 本体が更新中に落ちると鍵が残る。本体と同じ基準で放置分は奪い返す。
+        lock = mag.storage_lock_path()
+        os.makedirs(os.path.dirname(lock), exist_ok=True)
+        os.mkdir(lock)
+        os.utime(lock, (time.time() - 60, time.time() - 60))
+        with mag.live_write_lock() as held:
+            self.assertTrue(held)
+        self.assertFalse(os.path.exists(lock))
+
+    def test_swapping_leaves_no_lock_behind(self):
+        mag.write_live_creds({"claudeAiOauth": {"accessToken": "sk-ant-old"}})
+        mag.install_oauth({"accessToken": "sk-ant-new", "refreshToken": "r1",
+                           "expiresAt": (time.time() + 9999) * 1000})
+        self.assertFalse(os.path.exists(mag.storage_lock_path()))
+
     def test_an_expired_credential_is_refused(self):
         mag.write_live_creds({"claudeAiOauth": {"accessToken": "sk-ant-old"}})
         with self.assertRaises(RuntimeError):
             mag.install_oauth({"accessToken": "sk-ant-x", "refreshToken": "r",
                                "expiresAt": (time.time() - 60) * 1000})
+
+
+class LiveTokenIsTheMainProcessJob(Base):
+    """現用スロットのトークンは本体だけが更新する。
+
+    Anthropic の refresh token は使い捨てで、使うと次のものに切り替わる。
+    弾倉が先に使ってしまうと本体が握っている分が失効し、走っている
+    セッションが "Not logged in · Please run /login" で止まる。
+    """
+
+    def test_the_live_token_is_never_refreshed_by_us(self):
+        live = {"accessToken": "sk-ant-live", "refreshToken": "r-live",
+                "expiresAt": (time.time() - 10) * 1000}
+        self.patch("current_oauth", lambda: live)
+        self.patch("refresh_oauth", lambda o: self.fail("現用のトークンを更新してはいけない"))
+        self.assertIs(mag.ensure_fresh("a", live), live)
+
+    def test_a_benched_account_is_still_refreshed(self):
+        spare = {"accessToken": "sk-ant-spare", "refreshToken": "r-spare",
+                 "expiresAt": (time.time() - 10) * 1000}
+        self.patch("current_oauth", lambda: {"refreshToken": "r-live"})
+        self.patch("refresh_oauth", lambda o: {**o, "accessToken": "sk-ant-new",
+                                               "expiresAt": (time.time() + 9999) * 1000})
+        out = mag.ensure_fresh("spare", spare)
+        self.assertEqual(out["accessToken"], "sk-ant-new")
+
+    def test_the_live_account_is_probed_with_the_live_credential(self):
+        # 本体が更新した直後は保管庫のコピーが古い。古い方で判定すると
+        # 生きているアカウントを「失効」と誤診してしまう。
+        self.add_account("a")
+        mag.set_current("claude", "a")
+        self.patch("stored_oauth", lambda s: {"accessToken": "sk-ant-stale",
+                                              "refreshToken": "r-old",
+                                              "expiresAt": (time.time() - 10) * 1000})
+        self.patch("current_oauth", lambda: {"accessToken": "sk-ant-fresh",
+                                             "refreshToken": "r-new",
+                                             "expiresAt": (time.time() + 9999) * 1000})
+        seen = {}
+
+        def usage(oauth):
+            seen["token"] = oauth["accessToken"]
+            return {"five_hour": {"utilization": 10, "resets_at": None}}
+        self.patch("fetch_usage", usage)
+        p = mag.probe("a")
+        self.assertEqual(seen["token"], "sk-ant-fresh", "現用は現用スロットの実物で見る")
+        self.assertTrue(p["ok"])
+
+    def test_an_expired_live_token_is_not_treated_as_dead(self):
+        # 本体が更新するまでの間は残量が読めないだけ。ここで弾を捨てると
+        # まだ使えるアカウントを外して無駄に切り替えてしまう。
+        self.add_account("a")
+        mag.set_current("claude", "a")
+        expired = {"accessToken": "sk-ant-x", "refreshToken": "r-live",
+                   "expiresAt": (time.time() - 10) * 1000}
+        self.patch("stored_oauth", lambda s: expired)
+        self.patch("current_oauth", lambda: expired)
+        p = mag.probe("a")
+        self.assertFalse(p.get("dead"))
+        self.assertTrue(p["info_unavailable"])
+        self.assertTrue(mag.is_usable("a", p)[0])
+
+
+class LiveSlotNaming(unittest.TestCase):
+    """現用スロットの置き場は本体と同じ規則で決める。ずれると本体からは
+    ログアウトしたように見える。"""
+
+    def tearDown(self):
+        os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        os.environ.pop("CLAUDE_SECURESTORAGE_CONFIG_DIR", None)
+
+    def test_default_has_no_suffix(self):
+        self.assertEqual(mag.live_service(), "Claude Code-credentials")
+
+    def test_a_moved_config_dir_gets_its_own_entry(self):
+        os.environ["CLAUDE_CONFIG_DIR"] = "/tmp/elsewhere"
+        self.assertEqual(mag.live_service(), mag.isolated_claude_service("/tmp/elsewhere"))
+        self.assertNotEqual(mag.live_service(), "Claude Code-credentials")
+
+    def test_account_name_falls_back_to_the_shape_the_cli_uses(self):
+        self.assertRegex(mag.LIVE_ACCOUNT, r"^[A-Za-z0-9._-]+$")
 
 
 class Helpers(Base):

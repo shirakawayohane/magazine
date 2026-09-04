@@ -7,6 +7,14 @@ claude-magazine — 複数の Claude Max アカウントを「弾倉」のよう
 - 弾倉スロット : service="claude-magazine"        / account=<slug>
   ※ 現用スロットには MCP の OAuth (mcpOAuth) が同居しているので claudeAiOauth だけを差し替える
 
+現用スロットの扱いには 2 つの約束がある（守らないと走っているセッションが落ちる）:
+  1. トークンの更新（refresh）は Claude Code 本体だけの仕事。refresh token は
+     使い捨てなので、弾倉が横から更新すると本体が握っている分が失効する。
+     弾倉は読むだけで、書くのは弾を入れ替えるときだけ。
+  2. 書くときは本体と同じ書き込みロック
+     （<設定ディレクトリ>/.storage-write.lock）を取る。取らずに書くと、
+     本体が更新した直後の内容を古い弾で踏み潰す。
+
 残量の見方は 2 系統:
   1. statusLine 経由 … Claude Code が statusLine に渡す rate_limits（追加コストなし）
   2. usage API      … https://api.anthropic.com/api/oauth/usage
@@ -17,6 +25,8 @@ CLI 本体には干渉しない。端末を横取りしたり、走っている�
 from __future__ import annotations
 
 import argparse
+import contextlib
+import hashlib
 import json
 import os
 import re
@@ -24,6 +34,7 @@ import shutil
 import subprocess
 import sys
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 import uuid
@@ -96,7 +107,34 @@ LIVE_DIR = os.path.join(ROOT, "live")
 LOG_PATH = os.path.join(ROOT, "logs", "mag.log")
 
 LIVE_SERVICE = "Claude Code-credentials"
-LIVE_ACCOUNT = os.environ.get("USER") or os.path.basename(HOME)
+
+
+def _os_username() -> str:
+    """Node の os.userInfo().username 相当（本体はこれを使う）。"""
+    try:
+        import pwd
+        return pwd.getpwuid(os.getuid()).pw_name
+    except Exception:
+        return os.environ.get("USERNAME") or os.path.basename(HOME)
+
+
+def _live_account() -> str:
+    """現用スロットの account 名。本体（2.1.260 で確認）と同じ決め方にする。
+
+    ここがずれると別のエントリを読み書きしてしまい、本体からは「ログアウト
+    した」ように見える。本体は $USER → os.userInfo().username の順に見て、
+    英数と ._- 以外が混じっていたら claude-code-user に落とす。
+    """
+    try:
+        name = os.environ.get("USER") or _os_username()
+    except Exception:
+        name = "claude-code-user"
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", name or ""):
+        return "claude-code-user"
+    return name
+
+
+LIVE_ACCOUNT = _live_account()
 MAG_SERVICE = "claude-magazine"
 
 CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
@@ -312,20 +350,105 @@ def claude_creds_file() -> str:
     return os.path.join(claude_config_dir(), ".credentials.json")
 
 
+def isolated_claude_service(config_dir: str) -> str:
+    """CLAUDE_CONFIG_DIR を変えたときに Claude Code が使う Keychain のサービス名。
+
+    本体は `Claude Code-credentials-<sha256(設定ディレクトリ)の先頭8桁>` にする
+    （2.1.260 で確認）。この規則が変わると回収に失敗して明示的にエラーになる。
+    """
+    d = unicodedata.normalize("NFC", config_dir)
+    return f"{LIVE_SERVICE}-{hashlib.sha256(d.encode('utf-8')).hexdigest()[:8]}"
+
+
+def live_service() -> str:
+    """いま本体が使っている現用スロットのサービス名。
+
+    設定ディレクトリを環境変数でずらしていると本体は別のエントリを使う。
+    固定名を読み書きすると、本体から見て「ログアウトした」状態になる。
+    """
+    d = os.environ.get("CLAUDE_SECURESTORAGE_CONFIG_DIR")
+    if d is None:
+        d = os.environ.get("CLAUDE_CONFIG_DIR")
+    return isolated_claude_service(d) if d else LIVE_SERVICE
+
+
 def live_creds() -> dict:
     if use_keychain():
-        return kc_read(LIVE_SERVICE, LIVE_ACCOUNT) or {}
+        return kc_read(live_service(), LIVE_ACCOUNT) or {}
     return read_json(claude_creds_file(), None) or {}
 
 
 def write_live_creds(creds: dict) -> None:
     if use_keychain():
-        kc_write(LIVE_SERVICE, LIVE_ACCOUNT, creds)
+        kc_write(live_service(), LIVE_ACCOUNT, creds)
         return
     path = claude_creds_file()
     os.makedirs(os.path.dirname(path), exist_ok=True)
     write_json(path, creds)
     harden_path(path, 0o600)
+
+
+# 本体（2.1.259 以降）は現用スロットを書き換える前にこのロックを取る。
+# proper-lockfile 互換で、印は <設定ディレクトリ>/.storage-write.lock というディレクトリ。
+# 同じロックを取らずに書くと、本体がトークンを更新した直後に古い内容で上書きしてしまい、
+# 走っているセッションが "Not logged in · Please run /login" を掴む。
+STORAGE_LOCK_NAME = ".storage-write.lock"
+STORAGE_LOCK_STALE = 15.0     # 本体が「放置された鍵」と見なす秒数
+
+
+def storage_lock_path() -> str:
+    return os.path.join(claude_config_dir(), STORAGE_LOCK_NAME)
+
+
+@contextlib.contextmanager
+def live_write_lock():
+    """本体と同じ書き込みロックを握る。取れなかった場合も止めずに続ける
+    （切り替えが永久に止まる方が困る）。握れたかどうかを yield する。"""
+    path = storage_lock_path()
+    held = None
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    except OSError as e:
+        log(f"live_write_lock: 置き場を作れません ({e}) — ロック無しで続行")
+        yield False
+        return
+
+    deadline = now() + STORAGE_LOCK_STALE + 5.0
+    wait = 0.05
+    while now() < deadline:
+        try:
+            os.mkdir(path)
+            held = os.stat(path).st_mtime_ns
+            break
+        except FileExistsError:
+            pass
+        except OSError as e:
+            log(f"live_write_lock: 使えません ({e}) — ロック無しで続行")
+            break
+        try:
+            age = now() - os.stat(path).st_mtime
+        except OSError:
+            age = 0.0
+        if age > STORAGE_LOCK_STALE:
+            try:
+                os.rmdir(path)      # 本体と同じ基準で放置された鍵を外す
+            except OSError:
+                pass
+            continue
+        time.sleep(wait)
+        wait = min(wait * 2, 0.5)
+    if held is None:
+        log("live_write_lock: 取得できないまま続行します（本体と競合の可能性）")
+
+    try:
+        yield held is not None
+    finally:
+        if held is not None:
+            try:
+                if os.stat(path).st_mtime_ns == held:
+                    os.rmdir(path)
+            except OSError:
+                pass
 
 
 def current_oauth() -> dict | None:
@@ -337,8 +460,8 @@ def install_oauth(oauth: dict) -> None:
 
     稼働中のセッションは Keychain を都度読み直すため、書き換えが中途半端だと
     走っているセッションが "Not logged in · Please run /login" を掴んでしまう。
-    そのため (1) 事前に中身を検証し (2) 書き戻して読み直しで確認し
-    (3) 壊れていたら即座に元へ戻す。
+    そのため (1) 事前に中身を検証し (2) 本体と同じ書き込みロックを取り
+    (3) 書き戻して読み直しで確認し (4) 壊れていたら即座に元へ戻す。
     """
     token = (oauth or {}).get("accessToken")
     if not token or not str(token).startswith("sk-ant-"):
@@ -347,31 +470,36 @@ def install_oauth(oauth: dict) -> None:
     if exp and (exp / 1000.0) <= now():
         raise RuntimeError(T("The credential to activate has an expired accessToken", "有効化しようとした認証情報の accessToken が期限切れです"))
 
-    before = live_creds()
-    creds = dict(before)
-    creds["claudeAiOauth"] = oauth
+    # 読み → 差し替え → 書き の一連を丸ごとロックの中でやる。
+    # 途中で本体が更新すると、その新しい弾を古い内容で踏み潰してしまう。
+    with live_write_lock() as locked:
+        before = live_creds()
+        creds = dict(before)
+        creds["claudeAiOauth"] = oauth
 
-    last_err = None
-    for attempt in range(3):
-        try:
-            write_live_creds(creds)
-        except RuntimeError as e:
-            last_err = e
+        last_err = None
+        for attempt in range(3):
+            try:
+                write_live_creds(creds)
+            except RuntimeError as e:
+                last_err = e
+                time.sleep(0.2)
+                continue
+            back = live_creds().get("claudeAiOauth") or {}
+            if back.get("accessToken") == token:
+                log(f"install: 現用スロットを差し替えました "
+                    f"(expires={fmt_when(exp / 1000.0 if exp else None)}, lock={'取得' if locked else '無し'})")
+                return
+            last_err = RuntimeError("書き戻しの確認に失敗しました")
             time.sleep(0.2)
-            continue
-        back = live_creds().get("claudeAiOauth") or {}
-        if back.get("accessToken") == token:
-            return
-        last_err = RuntimeError("書き戻しの確認に失敗しました")
-        time.sleep(0.2)
 
-    # ここまで来たら壊れている可能性がある。元の弾に戻す。
-    if before.get("claudeAiOauth"):
-        try:
-            write_live_creds(before)
-            log("install_oauth: 失敗したため元の弾へロールバックしました")
-        except RuntimeError:
-            log("install_oauth: ロールバックにも失敗（要 `claude auth login`）")
+        # ここまで来たら壊れている可能性がある。元の弾に戻す。
+        if before.get("claudeAiOauth"):
+            try:
+                write_live_creds(before)
+                log("install_oauth: 失敗したため元の弾へロールバックしました")
+            except RuntimeError:
+                log("install_oauth: ロールバックにも失敗（要 `claude auth login`）")
     raise last_err or RuntimeError(T("Failed to write the credential", "認証情報の書き込みに失敗しました"))
 
 
@@ -448,18 +576,33 @@ def refresh_oauth(oauth: dict) -> dict | None:
     return None
 
 
+def is_live_oauth(oauth: dict) -> bool:
+    """この認証情報が、いま現用スロットに入っているものか。"""
+    rt = (oauth or {}).get("refreshToken")
+    return bool(rt) and (current_oauth() or {}).get("refreshToken") == rt
+
+
 def ensure_fresh(slug: str | None, oauth: dict) -> dict:
-    """期限切れ間近なら refresh し、保管庫にも書き戻す。"""
+    """期限切れ間近なら refresh し、保管庫にも書き戻す。
+
+    ただし現用スロットに入っている弾には絶対に触らない。Anthropic の
+    refresh token は使い捨て（使うと次のものに切り替わる）なので、本体と
+    弾倉の両方が更新しにいくと、負けた方が握っているトークンが失効する。
+    本体が負けると、走っているセッションが
+    "Not logged in · Please run /login" で止まる。
+    現用の更新は本体だけの仕事にして、弾倉は sync_live_credentials で追従する。
+    """
     exp = oauth.get("expiresAt")
     if exp and (exp / 1000.0) - now() > 120:
+        return oauth
+    if is_live_oauth(oauth):
         return oauth
     new = refresh_oauth(oauth)
     if not new:
         return oauth
     if slug:
         store_oauth(slug, new)
-    if current_oauth() and current_oauth().get("refreshToken") == oauth.get("refreshToken"):
-        install_oauth(new)
+        log(f"refresh: {slug} のトークンを更新しました（現用ではない弾）")
     return new
 
 
@@ -912,6 +1055,13 @@ def sync_live_credentials() -> str | None:
             return a["slug"]
     email = identify_claude_token(lat)
     if not email:
+        # 保管庫が現用より古いのに、持ち主を確認できない（圏外など）。
+        # このまま切り替えると古いトークンを掴むので、気づけるように残す。
+        s = state()
+        if now() - float(s.get("sync_warned_at") or 0) > 600:
+            s["sync_warned_at"] = now()
+            save_state(s)
+            log("sync: 現用トークンの持ち主を確認できず、保管庫が古いままです（圏外?）")
         return None
     for a in accounts_of("claude"):
         if (a.get("email") or "").lower() == email.lower():
@@ -1008,6 +1158,12 @@ def probe(slug: str, quiet: bool = True) -> dict:
     res = {"slug": slug, "ok": False, "five_hour": None, "seven_day": None,
            "scoped": [], "error": None, "info_unavailable": False}
     oauth = stored_oauth(slug)
+    # 現用の弾は「現用スロットの実物」で見る。本体がトークンを更新した直後は
+    # 保管庫のコピーが古いままになるが、それは弾が死んだという意味ではない。
+    if get_current("claude") == slug:
+        live = current_oauth()
+        if live and live.get("accessToken"):
+            oauth = live
     if not oauth:
         res["error"] = T("no stored credential in keychain", "Keychain に認証情報がありません")
         return res
@@ -1015,6 +1171,13 @@ def probe(slug: str, quiet: bool = True) -> dict:
         oauth = ensure_fresh(slug, oauth)
         exp = oauth.get("expiresAt")
         if exp and (exp / 1000.0) <= now():
+            if is_live_oauth(oauth):
+                # 現用の更新は本体の仕事。更新されるまで残量が読めないだけで、
+                # 弾が死んだわけではないので使用不可にはしない。
+                res["error"] = T("waiting for Claude Code to refresh the live token (usage unknown)",
+                                 "本体のトークン更新待ち（残量不明）")
+                res["info_unavailable"] = True
+                return res
             # 期限切れなのに更新できなかった＝refresh token が失効している
             res["error"] = T("needs re-login (refresh token revoked)", "要再ログイン（refresh token 失効）")
             res["dead"] = True
@@ -1244,17 +1407,6 @@ def confirm(question: str) -> bool:
         return input(f"{question} [y/N] ").strip().lower() in ("y", "yes")
     except EOFError:
         return False
-
-
-def isolated_claude_service(config_dir: str) -> str:
-    """CLAUDE_CONFIG_DIR を変えたときに Claude Code が使う Keychain のサービス名。
-
-    本体は `Claude Code-credentials-<sha256(設定ディレクトリ)の先頭8桁>` にする
-    （2.1.259 で確認）。この規則が変わると回収に失敗して明示的にエラーになる。
-    """
-    import hashlib, unicodedata
-    d = unicodedata.normalize("NFC", config_dir)
-    return f"{LIVE_SERVICE}-{hashlib.sha256(d.encode('utf-8')).hexdigest()[:8]}"
 
 
 def claude_keychain_services() -> set:
@@ -2247,9 +2399,14 @@ def already_warmed(target: str) -> bool:
 
 def mark_warmed(target: str, ok: bool, msg: str) -> None:
     s = state()
-    s.setdefault("warm", {})[target] = {
+    warm = s.setdefault("warm", {})
+    warm[target] = {
         "at": now(), "ok": ok, "msg": msg, "for_since": s.get("last_switch", 0),
     }
+    # 外した弾の検証結果が残ると、doctor に出ない名前の NG が並んで紛らわしい
+    known = {a["slug"] for a in accounts()}
+    for slug in [k for k in warm if k not in known]:
+        del warm[slug]
     save_state(s)
 
 
@@ -2321,9 +2478,11 @@ def cmd_watch(args) -> int:
     interval = args.interval
     print(f"👁 watch 開始: 閾値 {th}% / {interval}s ごと / ログ {LOG_PATH}")
     log(f"watch start (threshold={th}, interval={interval})")
+    mark_watch_alive(started=True)
     last_api = 0.0
     while True:
         try:
+            mark_watch_alive()
             clear_expired_cooldowns()
             reconcile_current()   # 手動 login で外から差し替えられていても追従する
             cur = get_current("claude")
@@ -2403,6 +2562,63 @@ def cmd_watch(args) -> int:
             time.sleep(interval)
 
 
+WATCH_HEARTBEAT = 60.0    # state に生存を書き込む間隔（秒）
+
+
+def mark_watch_alive(started: bool = False) -> None:
+    """常駐監視が「どの版で」「いつまで」動いていたかを残す。
+
+    mag.py を更新しても常駐を再起動するまで古い版が動き続ける。
+    後から気づけるよう、動いている版のタイムスタンプを置いておく。
+    """
+    s = state()
+    w = s.get("watch") or {}
+    if not started and now() - float(w.get("at") or 0) < WATCH_HEARTBEAT:
+        return
+    path = os.path.abspath(__file__)
+    try:
+        mtime = os.stat(path).st_mtime
+    except OSError:
+        mtime = None
+    s["watch"] = {
+        "pid": os.getpid(), "at": now(), "script": path, "script_mtime": mtime,
+        "version": VERSION,
+        "started_at": now() if started else (w.get("started_at") or now()),
+    }
+    save_state(s)
+
+
+def watch_restart_hint() -> str:
+    if IS_MAC:
+        return f"launchctl kickstart -k gui/{os.getuid()}/com.claude-magazine.watch"
+    if IS_WINDOWS:
+        return "schtasks /end /tn magazine-watch && schtasks /run /tn magazine-watch"
+    return "systemctl --user restart magazine-watch"
+
+
+def watch_version_state() -> tuple[bool, str]:
+    """常駐が今のファイルと同じ版で動いているか (揃っている?, 説明)。"""
+    w = state().get("watch") or {}
+    if not w.get("at"):
+        return True, T("version unknown (restart once to start reporting)",
+                       "版は不明（一度再起動すると分かるようになります）")
+    age = now() - float(w["at"])
+    if age > 10 * 60:
+        return False, T(f"last heartbeat {int(age // 60)} min ago — it may be dead",
+                        f"最後の生存確認が {int(age // 60)} 分前 — 落ちている可能性")
+    path = w.get("script") or os.path.abspath(__file__)
+    try:
+        disk = os.stat(path).st_mtime
+    except OSError:
+        return True, T("running", "稼働中")
+    if w.get("script_mtime") and abs(disk - float(w["script_mtime"])) > 1:
+        return False, T(f"running an older copy (loaded {fmt_when(float(w['script_mtime']))})"
+                        f" — restart it: {watch_restart_hint()}",
+                        f"読み込んだのは {datetime.fromtimestamp(float(w['script_mtime'])):%m/%d %H:%M} 版 —"
+                        f" 再起動してください: {watch_restart_hint()}")
+    return True, T("running the current version", "現在の版で稼働中")
+
+
 def watch_daemon_state() -> str:
     """常駐監視が動いているか。見え方は OS ごとに違う。"""
     try:
@@ -2442,7 +2658,7 @@ def cmd_doctor(args) -> int:
     ok = True
     print(T("-- magazine doctor --", "-- magazine doctor --"))
     cur = current_oauth()
-    where = (f"keychain {LIVE_SERVICE}/{LIVE_ACCOUNT}" if use_keychain()
+    where = (f"keychain {live_service()}/{LIVE_ACCOUNT}" if use_keychain()
              else claude_creds_file())
     print(T(f"live credential    : {'OK' if cur else 'not found'}  ({where})",
             f"現用の認証情報     : {'OK' if cur else '見つからない'}  ({where})"))
@@ -2499,10 +2715,27 @@ def cmd_doctor(args) -> int:
             f"statusLine 連携    : {'OK' if hooked else '未接続（mag install-statusline で接続）'}"))
     print(T(f"watch daemon       : {watch_daemon_state()}",
             f"watch 常駐         : {watch_daemon_state()}"))
+    fresh, why = watch_version_state()
+    print(T(f"watch version      : {why}", f"watch の版         : {why}"))
+    ok &= fresh
+    # 現用スロットは本体も同時に書き換える。同じロックを取れているかを見せる。
+    lock = storage_lock_path()
+    holder = ""
+    if os.path.isdir(lock):
+        try:
+            holder = T(f" (held, {int(now() - os.stat(lock).st_mtime)}s)",
+                       f"（保持中・{int(now() - os.stat(lock).st_mtime)}秒）")
+        except OSError:
+            holder = ""
+    print(T(f"write lock         : {lock}{holder}",
+            f"書き込みロック     : {lock}{holder}"))
     warm = state().get("warm") or {}
     if warm:
         print(T("pre-checked next   :", "次の候補の事前検証 :"))
+        known = {a["slug"] for a in accounts()}
         for slug, w in warm.items():
+            if slug not in known:
+                continue
             mark = "OK" if w.get("ok") else f"NG ({w.get('msg', '')[:40]})"
             print(f"  - {label_of(slug):<32} {mark}")
     print(T(f"log                : {LOG_PATH}", f"ログ               : {LOG_PATH}"))
