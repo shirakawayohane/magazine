@@ -1058,7 +1058,7 @@ def is_usable(slug: str, p: dict = None) -> tuple[bool, str]:
     for kind, th in (("five_hour", cfg["five_hour_threshold"]), ("seven_day", cfg["seven_day_threshold"])):
         pct = (p[kind] or {}).get("pct")
         if pct is not None and pct >= th:
-            return False, f"{kind} {pct:.1f}% ≥ 閾値{th:.1f}%"
+            return False, T(f"{kind} {pct:.1f}% ≥ threshold {th:.1f}%", f"{kind} {pct:.1f}% ≥ 閾値{th:.1f}%")
     return True, "ok"
 
 
@@ -1517,10 +1517,11 @@ def _print_magazine(accs: list, prov: str, args) -> int:
                               "    残量の記録なし（codex で1回やり取りすると出ます）"))
                     else:
                         for w in lim["windows"]:
-                            print(f"    {w['label']:<8}{bar(w['pct'])}   reset {fmt_when(w['resets_at'])}")
+                            print(f"    {w['label']:<10}{bar(w['pct'])}   reset {fmt_when(w['resets_at'])}")
                         if lim.get("reached"):
-                            print(f"    ⛔ 上限到達: {lim['reached']}")
-                        print(f"    （{datetime.fromtimestamp(lim['ts']):%m/%d %H:%M} 時点の記録）")
+                            print(T(f"    ⛔ limit reached: {lim['reached']}", f"    ⛔ 上限到達: {lim['reached']}"))
+                        print(T(f"    (recorded at {datetime.fromtimestamp(lim['ts']):%m/%d %H:%M})",
+                                f"    （{datetime.fromtimestamp(lim['ts']):%m/%d %H:%M} 時点の記録）"))
                 else:
                     print(T("    usage readable only while active (codex records it at runtime)",
                           "    残量は使用中のみ取得可（codex は実行時に記録するため）"))
@@ -1530,12 +1531,16 @@ def _print_magazine(accs: list, prov: str, args) -> int:
         if not p["ok"]:
             print(f"    ? {p['error']}")
         else:
-            print(f"    5h  {bar((p['five_hour'] or {}).get('pct'))}   reset {fmt_when((p['five_hour'] or {}).get('resets_at'))}")
-            print(f"    7d  {bar((p['seven_day'] or {}).get('pct'))}   reset {fmt_when((p['seven_day'] or {}).get('resets_at'))}")
-            for sc in p.get("scoped") or []:
-                if sc["pct"] >= 80:
-                    print(f"    └ {sc['model']}枠 {sc['pct']:.0f}%（このモデルのみ・他は使えます）"
-                          f"  reset {fmt_when(sc['resets_at'])}")
+            rows = [("5h", p["five_hour"] or {}), ("7d", p["seven_day"] or {})]
+            # モデル別の週次枠（Fable など）。全体枠とは別勘定なので同じゲージで並べる。
+            rows += [(f"7d/{sc['model']}", sc) for sc in p.get("scoped") or []]
+            width = max(4, max(len(k) for k, _ in rows) + 2)
+            for key, blk in rows:
+                dim = "\033[2m" if "/" in key else ""
+                note = ""
+                if "/" in key and (blk.get("pct") or 0) >= 80:
+                    note = T("  (this model only; others still work)", "  （このモデルのみ・他は使えます）")
+                print(f"    {dim}{key:<{width}}\033[0m{bar(blk.get('pct'))}   reset {fmt_when(blk.get('resets_at'))}{note}")
         left = cooldown_left(slug)
         if left > 0:
             cd = state()["cooldowns"][slug]
@@ -1547,8 +1552,8 @@ def _print_magazine(accs: list, prov: str, args) -> int:
                         f"    ⏳ 上限到達 ({cd.get('kind')}) → {fmt_when(cd['until'])}"))
         w = (state().get("warm") or {}).get(slug)
         if w and w.get("for_since") == state().get("last_switch", 0):
-            print(T(f"    🔥 pre-checked: {'OK' if w.get('ok') else 'FAILED: ' + w.get('msg','')[:40]}",
-                  f"    🔥 事前検証 {'OK' if w.get('ok') else 'NG: ' + w.get('msg','')[:40]}"))
+            print(T(f"    🔥 pre-check as next account: {'OK (a small request went through)' if w.get('ok') else 'FAILED: ' + w.get('msg','')[:40]}",
+                  f"    🔥 切替候補としての事前確認: {'OK（軽いリクエストが通った）' if w.get('ok') else 'NG: ' + w.get('msg','')[:40]}"))
         print()
     return 0
 
@@ -1698,9 +1703,11 @@ def cmd_limits(args) -> int:
                 print(T("      \033[33m💸 metered billing ON — going over the plan window will cost money\033[0m",
                         "      \033[33m💸 従量課金が有効 — 枠を超えると課金されます\033[0m"))
             if r.get("stale_ts"):
-                print(f"      \033[2m(前回観測: {datetime.fromtimestamp(r['stale_ts']):%m/%d %H:%M} 時点)\033[0m")
+                print(T(f"      \033[2m(last seen {datetime.fromtimestamp(r['stale_ts']):%m/%d %H:%M})\033[0m",
+                        f"      \033[2m(前回観測: {datetime.fromtimestamp(r['stale_ts']):%m/%d %H:%M} 時点)\033[0m"))
             if r.get("reached"):
-                print(f"      \033[31m⛔ 上限到達: {r['reached']}\033[0m")
+                print(T(f"      \033[31m⛔ limit reached: {r['reached']}\033[0m",
+                        f"      \033[31m⛔ 上限到達: {r['reached']}\033[0m"))
     print()
     return 0
 
