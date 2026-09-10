@@ -189,13 +189,13 @@ def now() -> float:
 def log(msg: str) -> None:
     os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with open(LOG_PATH, "a") as f:
+    with open(LOG_PATH, "a", encoding="utf-8") as f:
         f.write(f"[{stamp}] {msg}\n")
 
 
 def read_json(path: str, default):
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return default
@@ -204,7 +204,7 @@ def read_json(path: str, default):
 def write_json(path: str, data) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
-    with open(tmp, "w") as f:
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
     os.replace(tmp, path)
 
@@ -665,14 +665,14 @@ def codex_install_auth(auth: dict) -> None:
         raise RuntimeError(T("The Codex credential to activate is malformed", "有効化しようとした Codex の認証情報が壊れています"))
     before = codex_live_auth()
     tmp = CODEX_AUTH_PATH + ".mag.tmp"
-    with open(tmp, "w") as f:
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(auth, f, indent=2)
     os.chmod(tmp, 0o600)
     os.replace(tmp, CODEX_AUTH_PATH)
     back = codex_live_auth() or {}
     if (back.get("tokens") or {}).get("access_token") != tok["access_token"]:
         if before:
-            with open(tmp, "w") as f:
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(before, f, indent=2)
             os.chmod(tmp, 0o600)
             os.replace(tmp, CODEX_AUTH_PATH)
@@ -780,7 +780,7 @@ def codex_live_limits(max_files: int = 20, only_after: float = None) -> dict | N
     best = None
     for _mt, p in files[:max_files]:
         try:
-            with open(p, errors="replace") as f:
+            with open(p, errors="replace", encoding="utf-8") as f:
                 for line in f:
                     if '"rate_limits"' not in line:
                         continue
@@ -850,7 +850,7 @@ def codex_probe(slug: str, timeout: int = 90) -> dict | None:
     import tempfile, shutil as _sh
     home = tempfile.mkdtemp(prefix="mag-codex-")
     try:
-        with open(os.path.join(home, "auth.json"), "w") as f:
+        with open(os.path.join(home, "auth.json"), "w", encoding="utf-8") as f:
             json.dump(auth, f)
         os.chmod(os.path.join(home, "auth.json"), 0o600)
         src_cfg = os.path.expanduser("~/.codex/config.toml")
@@ -874,7 +874,7 @@ def codex_probe(slug: str, timeout: int = 90) -> dict | None:
                 if not n.endswith(".jsonl"):
                     continue
                 try:
-                    with open(os.path.join(root, n), errors="replace") as f:
+                    with open(os.path.join(root, n), errors="replace", encoding="utf-8") as f:
                         for line in f:
                             if '"rate_limits"' not in line:
                                 continue
@@ -2127,7 +2127,7 @@ def find_workflow(session_dir: str) -> dict | None:
             if not os.path.exists(jr):
                 continue
             try:
-                with open(jr, errors="replace") as f:
+                with open(jr, errors="replace", encoding="utf-8") as f:
                     n = sum(1 for l in f if l.strip() and '"type":"result"' in l.replace(" ", ""))
                 best["cached_agents"] = max(best["cached_agents"], n)
                 best["journal"] = jr
@@ -2711,7 +2711,7 @@ def cmd_doctor(args) -> int:
     for fn in ("statusline-command.sh", "statusline-command.cmd"):
         p_ = os.path.join(claude_config_dir(), fn)
         if os.path.exists(p_):
-            with open(p_, errors="replace") as f:
+            with open(p_, errors="replace", encoding="utf-8") as f:
                 body = f.read()
             # 実体を直接指すことも、PATH 上の mag（symlink）を指すこともある
             hooked = hooked or ("statusline" in body and re.search(r"\bmag(\.py)?\b", body) is not None)
@@ -2773,13 +2773,13 @@ def cmd_install_statusline(args) -> int:
 
     if os.path.exists(path):
         bak = path + f".bak.{time.time_ns()}"
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             old = f.read()
-        with open(bak, "w") as f:
+        with open(bak, "w", encoding="utf-8") as f:
             f.write(old)
         print(T(f"backup: {bak}", f"バックアップ: {bak}"))
 
-    with open(path, "w", newline="") as f:
+    with open(path, "w", newline="", encoding="utf-8") as f:
         f.write(script)
     if not IS_WINDOWS:
         os.chmod(path, 0o755)

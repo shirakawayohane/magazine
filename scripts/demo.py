@@ -26,6 +26,8 @@ def capture():
             mag = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mag)
         mag.use_keychain = lambda: False
+        # OS ACL helpers are outside this offline walkthrough's scope.
+        mag.harden_path = lambda path, mode: os.chmod(path, mode)
         mag.claude_config_dir = lambda: str(root / "claude")
         mag.CODEX_AUTH_PATH = str(root / "codex" / "auth.json")
         mag.PROJECTS_DIR = str(root / "projects")

@@ -20,7 +20,7 @@ OS="$(uname -s)"
 case "$OS" in
   Darwin) PLATFORM=mac ;;
   Linux)  PLATFORM=linux ;;
-  *)      die "未対応の環境です: $OS（Windows は windows\\install.ps1 を使ってください）" ;;
+  *)      die "未対応の環境です: ${OS}（Windows は windows\\install.ps1 を使ってください）" ;;
 esac
 command -v python3 >/dev/null || die "python3 が必要です"
 python3 -c 'import sys; sys.exit(sys.version_info < (3, 10))' || die "Python 3.10+ is required"
@@ -29,7 +29,7 @@ python3 -c 'import sys; sys.exit(sys.version_info < (3, 10))' || die "Python 3.1
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-/nonexistent}")" 2>/dev/null && pwd || true)"
 if [ -n "$HERE" ] && [ -f "$HERE/mag.py" ]; then
   SRC_DIR="$HERE"
-  say "magazine をインストールします（$SRC_DIR）"
+  say "magazine をインストールします（${SRC_DIR}）"
 else
   say "magazine をインストールします"
   command -v git >/dev/null || die "git が必要です"
@@ -100,7 +100,7 @@ if confirm "上限の手前で自動的にアカウントを切り替える常�
         "$SRC_DIR/launchd/com.magazine.watch.plist.template" > "$PLIST"
     launchctl bootout "gui/$(id -u)" "$PLIST" 2>/dev/null || true
     launchctl bootstrap "gui/$(id -u)" "$PLIST"
-    ok "常駐監視を起動（停止: launchctl bootout gui/$(id -u) $PLIST）"
+    ok "常駐監視を起動（停止: launchctl bootout gui/$(id -u) ${PLIST}）"
   elif command -v systemctl >/dev/null; then
     UNIT_DIR="$HOME/.config/systemd/user"
     mkdir -p "$UNIT_DIR"
