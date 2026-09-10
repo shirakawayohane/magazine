@@ -98,6 +98,7 @@ Add another account through the CLI's normal login flow in a temporary profile:
 
 ```sh
 mag login claude spare
+mag login claude main      # same-provider alias: re-store that account's credentials
 # Or: mag login codex codex-spare
 
 mag limits

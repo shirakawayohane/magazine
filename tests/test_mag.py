@@ -315,6 +315,153 @@ class CodexIdentity(Base):
         self.assertEqual(mag.codex_identity({})["email"], "unknown")
 
 
+class CodexSwitchNotice(Base):
+    """切り替えても、開いている codex セッションは次のターンまで前のアカウントで走る。
+
+    実測: mag が切り替えたあとも十数分は前のアカウントの数値が記録され続け、
+    その間に上限メッセージが1回出る。黙って切り替えると「切り替えたのに上限」に
+    見えるので、開いているセッションがありそうなときだけ一言添える。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.sessions = tempfile.mkdtemp(prefix="codex-sessions-")
+        self.patch("CODEX_SESSIONS_DIR", self.sessions)
+        self.addCleanup(shutil.rmtree, self.sessions, ignore_errors=True)
+
+    def write_session(self, name, age_seconds):
+        p = os.path.join(self.sessions, name)
+        with open(p, "w") as f:
+            f.write("{}\n")
+        t = time.time() - age_seconds
+        os.utime(p, (t, t))
+
+    def test_a_session_written_just_now_counts_as_open(self):
+        self.write_session("s.jsonl", 30)
+        self.assertTrue(mag.codex_session_recently_active())
+        self.assertIn("fd-codex", mag.codex_switch_note("fd-codex"))
+
+    def test_yesterdays_sessions_do_not_trigger_the_note(self):
+        self.write_session("old.jsonl", 24 * 3600)
+        self.assertFalse(mag.codex_session_recently_active())
+        self.assertIsNone(mag.codex_switch_note("fd-codex"), "誰も使っていないなら黙る")
+
+    def test_no_sessions_directory_is_not_an_error(self):
+        self.patch("CODEX_SESSIONS_DIR", os.path.join(self.sessions, "nope"))
+        self.assertFalse(mag.codex_session_recently_active())
+
+    def test_the_note_is_only_for_codex(self):
+        self.write_session("s.jsonl", 30)
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            mag.print_codex_switch_note("claude", "main")
+        self.assertEqual(buf.getvalue(), "", "claude は現用スロットを都度読み直すので不要")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            mag.print_codex_switch_note("codex", "fd-codex")
+        self.assertIn("fd-codex", buf.getvalue())
+
+
+class CodexTokenRotation(Base):
+    """OpenAI の refresh token は使うたびに回り、古い方はその場で死ぬ。
+
+    切り替えで ~/.codex/auth.json を上書きする前に、そこに入っている最新の
+    トークンを持ち主の保管庫へ退避しないと、戻ってきたときに失効した弾を掴む。
+    しかも失効した弾を装填すると codex 本体が auth.json ごと消すので、
+    直前まで使えていたログインまで失う（実際に起きた）。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.home = tempfile.mkdtemp(prefix="codex-home-")
+        self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
+        self.patch("CODEX_AUTH_PATH", os.path.join(self.home, "auth.json"))
+        self.add_account("cx1", provider="codex", email="one@example.com")
+        self.add_account("cx2", provider="codex", email="two@example.com")
+
+    @staticmethod
+    def auth(email, refresh_token, exp_in=3600):
+        import base64
+
+        def jwt(claims):
+            body = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+            return f"header.{body}.sig"
+
+        return {"tokens": {"access_token": jwt({"exp": time.time() + exp_in}),
+                           "id_token": jwt({"email": email}),
+                           "refresh_token": refresh_token},
+                "last_refresh": "2026-01-01T00:00:00Z"}
+
+    def put_live(self, auth):
+        with open(mag.CODEX_AUTH_PATH, "w") as f:
+            json.dump(auth, f)
+
+    def patch_urlopen(self, fn):
+        import urllib.request as ur
+        original = ur.urlopen
+        ur.urlopen = fn
+        self.addCleanup(setattr, ur, "urlopen", original)
+
+    def test_switching_away_saves_the_live_token_first(self):
+        mag.codex_store_auth("cx1", self.auth("one@example.com", "rt-stale"))
+        mag.codex_store_auth("cx2", self.auth("two@example.com", "rt-two"))
+        self.put_live(self.auth("one@example.com", "rt-rotated"))   # 本体が更新した後
+        self.patch("codex_refresh", lambda a: (a, None))
+        self.assertTrue(mag.do_load("cx2"))
+        self.assertEqual(mag.codex_stored_auth("cx1")["tokens"]["refresh_token"], "rt-rotated",
+                         "踏み潰す前に、現用の最新トークンを持ち主へ退避する")
+
+    def test_a_dead_credential_is_refused_instead_of_installed(self):
+        mag.codex_store_auth("cx1", self.auth("one@example.com", "rt-one"))
+        mag.codex_store_auth("cx2", self.auth("two@example.com", "rt-dead"))
+        self.put_live(self.auth("one@example.com", "rt-one"))
+        self.patch("codex_refresh", lambda a: (None, "Your session has ended."))
+        self.assertFalse(mag.do_load("cx2"), "失効した弾は装填しない")
+        self.assertEqual(mag.codex_live_auth()["tokens"]["refresh_token"], "rt-one",
+                         "使えていたログインはそのまま残る")
+        self.assertNotEqual(mag.get_current("codex"), "cx2")
+
+    def test_the_rotated_token_is_what_gets_stored_and_installed(self):
+        mag.codex_store_auth("cx2", self.auth("two@example.com", "rt-two"))
+        rotated = self.auth("two@example.com", "rt-two-next")
+        self.patch("codex_refresh", lambda a: (rotated, None))
+        self.assertTrue(mag.do_load("cx2"))
+        self.assertEqual(mag.codex_stored_auth("cx2")["tokens"]["refresh_token"], "rt-two-next")
+        self.assertEqual(mag.codex_live_auth()["tokens"]["refresh_token"], "rt-two-next")
+
+    def test_being_offline_does_not_block_the_switch(self):
+        mag.codex_store_auth("cx2", self.auth("two@example.com", "rt-two"))
+        self.patch("codex_refresh", lambda a: (None, None))
+        self.assertTrue(mag.do_load("cx2"), "圏外なら手元のトークンで進む")
+        self.assertEqual(mag.codex_live_auth()["tokens"]["refresh_token"], "rt-two")
+
+    def test_an_invalidated_refresh_token_is_reported_as_dead(self):
+        import io
+        import urllib.error
+
+        def rejected(req, timeout=None):
+            raise urllib.error.HTTPError(
+                mag.CODEX_TOKEN_URL, 401, "Unauthorized", {},
+                io.BytesIO(json.dumps({"error": {"code": "refresh_token_invalidated",
+                                                 "message": "Your session has ended."}}).encode()))
+
+        self.patch_urlopen(rejected)
+        new, dead = mag.codex_refresh(self.auth("one@example.com", "rt"))
+        self.assertIsNone(new)
+        self.assertIn("session has ended", dead)
+
+    def test_a_network_failure_is_not_treated_as_dead(self):
+        import urllib.error
+
+        def unreachable(req, timeout=None):
+            raise urllib.error.URLError("no route to host")
+
+        self.patch_urlopen(unreachable)
+        self.assertEqual(mag.codex_refresh(self.auth("one@example.com", "rt")), (None, None),
+                         "圏外を失効と取り違えると、生きている弾を捨てる")
+
+
 # ── 状態の持ち方 ──────────────────────────────────────────────────────────
 class StateHandling(Base):
     def test_legacy_single_account_state_still_reads(self):

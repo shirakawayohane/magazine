@@ -709,11 +709,18 @@ def codex_identity(auth: dict) -> dict:
     }
 
 
-def codex_refresh(auth: dict) -> dict | None:
+def codex_refresh(auth: dict) -> tuple[dict | None, str | None]:
+    """(更新後の auth, 失効理由) を返す。
+
+    OpenAI の refresh token は 1 回使うたびに新しいものへ回り、古い方は
+    その場で無効になる。なので 400/401 は「通信できなかった」ではなく
+    「この認証情報はもう蘇らない（再ログインが要る）」を意味する。
+    圏外などの一時的な失敗と混ぜないよう、理由を分けて返す。
+    """
     tok = (auth or {}).get("tokens") or {}
     rt = tok.get("refresh_token")
     if not rt:
-        return None
+        return None, T("no refresh token is stored", "refresh token が保管されていません")
     body = {"client_id": CODEX_CLIENT_ID, "grant_type": "refresh_token",
             "refresh_token": rt, "scope": "openid profile email"}
     try:
@@ -722,10 +729,18 @@ def codex_refresh(auth: dict) -> dict | None:
             headers={"Content-Type": "application/json", "User-Agent": CODEX_UA})
         with urllib.request.urlopen(req, timeout=20) as r:
             j = json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        if e.code not in (400, 401):
+            return None, None
+        try:
+            msg = ((json.loads(e.read().decode()) or {}).get("error") or {}).get("message")
+        except Exception:
+            msg = None
+        return None, msg or T("this sign-in has expired", "このログインは失効しています")
     except Exception:
-        return None
+        return None, None
     if not j.get("access_token"):
-        return None
+        return None, None
     new = json.loads(json.dumps(auth))
     new.setdefault("tokens", {})
     new["tokens"]["access_token"] = j["access_token"]
@@ -733,20 +748,28 @@ def codex_refresh(auth: dict) -> dict | None:
         if j.get(k):
             new["tokens"][k] = j[k]
     new["last_refresh"] = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
-    return new
+    return new, None
 
 
-def codex_ensure_fresh(slug: str | None, auth: dict) -> dict:
-    """access_token(JWT) の exp を見て、切れそうなら更新して保管庫へ書き戻す。"""
+def codex_ensure_fresh(slug: str | None, auth: dict, verify: bool = False) -> tuple[dict, str | None]:
+    """(使える auth, 失効理由)。更新できたら保管庫へ書き戻す。
+
+    verify=True では期限に関わらず必ず 1 回更新する。現用スロットを踏み潰す前に
+    「この弾はまだ生きているか」を確かめるため。refresh token はローテーションする
+    ので、保管したスナップショットは本体が 1 度更新しただけで死ぬ。死んだ弾を
+    装填すると codex 側が auth.json を消してしまい、生きていたログインまで失う。
+    """
     exp = jwt_claims(((auth or {}).get("tokens") or {}).get("access_token") or "").get("exp")
-    if exp and exp - now() > 300:
-        return auth
-    new = codex_refresh(auth)
+    if not verify and exp and exp - now() > 300:
+        return auth, None
+    new, dead = codex_refresh(auth)
+    if dead:
+        return auth, dead
     if not new:
-        return auth
+        return auth, None     # 通信できないだけ。手元のもので進む
     if slug:
         codex_store_auth(slug, new)
-    return new
+    return new, None
 
 
 def codex_sync_live() -> str | None:
@@ -774,6 +797,52 @@ def codex_sync_live() -> str | None:
 
 
 CODEX_SESSIONS_DIR = os.path.expanduser("~/.codex/sessions")
+
+
+def codex_session_recently_active(within: float = 1800) -> bool:
+    """直近 within 秒に書き込まれた codex セッションがあるか。
+
+    走っているセッションがあるかの目安。セッションは 1 ターンごとに
+    自分の JSONL へ追記するので、最終更新が新しければ誰かが使っている。
+    """
+    if not os.path.isdir(CODEX_SESSIONS_DIR):
+        return False
+    cutoff = now() - within
+    for root, _dirs, names in os.walk(CODEX_SESSIONS_DIR):
+        for n in names:
+            if not n.endswith(".jsonl"):
+                continue
+            try:
+                if os.path.getmtime(os.path.join(root, n)) >= cutoff:
+                    return True
+            except OSError:
+                continue
+    return False
+
+
+def codex_switch_note(name: str) -> str | None:
+    """切り替え直後に出す一言。開いているセッションが無さそうなら黙る。
+
+    codex は認証をターンの区切り（と認証エラーからの復帰）でしか読み直さない。
+    そのため開いているセッションは次のターンまで前のアカウントのまま走り、
+    その間に上限メッセージが出ることがある。実測では切り替えから反映まで
+    十数分かかり、「切り替えたのに上限と言われる」と見える。
+    """
+    if not codex_session_recently_active():
+        return None
+    return T(f"  note: an open codex session keeps using the previous account until its next turn "
+             f"(a limit message may show up once). Start a new session — or `codex resume` — to use {name} right away.",
+             f"  注: 開いている codex セッションは、次のターンまで前のアカウントのまま動きます"
+             f"（上限メッセージが1回出ることがあります）。すぐ {name} で使うなら、"
+             f"新しいセッションを開くか `codex resume` で開き直してください。")
+
+
+def print_codex_switch_note(prov: str, name: str) -> None:
+    if prov != "codex":
+        return
+    note = codex_switch_note(name)
+    if note:
+        print(note)
 
 
 def codex_live_limits(max_files: int = 20, only_after: float = None) -> dict | None:
@@ -870,7 +939,9 @@ def codex_probe(slug: str, timeout: int = 90) -> dict | None:
     auth = codex_stored_auth(slug)
     if not auth:
         return None
-    auth = codex_ensure_fresh(slug, auth)
+    auth, dead = codex_ensure_fresh(slug, auth)
+    if dead:
+        return {"dead": True, "error": dead}
     import tempfile, shutil as _sh
     home = tempfile.mkdtemp(prefix="mag-codex-")
     try:
@@ -1242,7 +1313,16 @@ def do_load(slug: str, reason: str = "") -> bool:
             print(T(f"✗ {name}: no stored credential in keychain", f"✗ {name}: Keychain に認証情報がありません"), file=sys.stderr)
             return False
         outgoing = codex_sync_live()
-        auth = codex_ensure_fresh(slug, auth)
+        # 装填してから死んでいると分かっても遅い（codex 本体が auth.json を
+        # 消してしまい、直前まで使えていたログインごと失う）。先に確かめる。
+        auth, dead = codex_ensure_fresh(slug, auth, verify=True)
+        if dead:
+            print(T(f"✗ {name}: {dead} — run `mag login codex {name}` to sign in again "
+                    f"(the active account is left as it is)",
+                    f"✗ {name}: {dead} — `mag login codex {name}` で入れ直してください"
+                    f"（今使っているアカウントはそのままです）"), file=sys.stderr)
+            log(f"load refused: {slug}: {dead}")
+            return False
         try:
             # 認証情報と state の持ち主が一致する場合だけ、切替前の記録を保存する。
             # 手動ログインなどで食い違っている場合は他アカウントへの誤帰属を避ける。
@@ -1258,6 +1338,8 @@ def do_load(slug: str, reason: str = "") -> bool:
         if not oauth:
             print(T(f"✗ {name}: no stored credential in keychain", f"✗ {name}: Keychain に認証情報がありません"), file=sys.stderr)
             return False
+        # codex と同じ理由で、現用スロットの最新トークンを先に退避する。
+        sync_live_credentials()
         oauth = ensure_fresh(slug, oauth)
         try:
             install_oauth(oauth)
@@ -1519,6 +1601,12 @@ def cmd_login(args) -> int:
         print(T("✗ alias is empty", "✗ alias が空です"), file=sys.stderr)
         return 1
     taken = label_taken_by(alias, accounts())
+    # provider が違えば同じメールでも別エントリになるため、ログイン後に
+    # 衝突が解消する可能性はない。不要な認証を始める前に弾く。
+    if taken and provider_of(taken) != prov:
+        err = label_conflict_error(alias, [taken])
+        print(f"✗ {err}", file=sys.stderr)
+        return 1
     if taken:
         print(T(f"note: alias '{alias}' is {describe(taken)}. Signing in as that account re-stores its credentials; any other account is refused.",
                 f"注: alias '{alias}' は {describe(taken)} です。同じアカウントでログインすれば認証の入れ直し、別アカウントなら拒否します。"))
@@ -1952,6 +2040,7 @@ def cmd_load(args) -> int:
     if not do_load(acct["slug"], "manual"):
         return 1
     print(T(f"🔁 switched to: {describe(acct)}", f"🔁 切り替え: {describe(acct)}"))
+    print_codex_switch_note(prov, display(acct))
     return 0
 
 
@@ -1975,6 +2064,7 @@ def cmd_next(args) -> int:
     if ok:
         acct = find_account(slug)
         print(T(f"🔁 switched to: {describe(acct)}", f"🔁 切り替え: {describe(acct)}"))
+        print_codex_switch_note(prov, display(acct))
     return 0 if ok else 1
 
 
@@ -2552,8 +2642,10 @@ def cmd_watch(args) -> int:
                             notify("🔫 claude-magazine", f"⚠ 次弾 {label} の事前検証に失敗: {msg[:60]}")
 
             # 1.7) Codex 側の監視。セッション JSONL に書かれた rate_limits を読む。
-            #      Claude と違い auth.json 差し替えは走行中プロセスに即時反映されないため、
-            #      ここでの入れ替えは「次に codex を起動したとき」から効く。
+            #      Claude と違い auth.json の差し替えは即時には効かない。codex は認証を
+            #      ターンの区切り（と認証エラーからの復帰）でしか読み直さないので、開いて
+            #      いるセッションは次のターンまで前のアカウントのまま走る（実測: 反映まで
+            #      十数分、その間に上限メッセージが1回出る）。
             cur_cx = get_current("codex")
             if cur_cx and accounts_of("codex"):
                 since = (state().get("last_switch_by") or {}).get("codex")
@@ -2568,7 +2660,9 @@ def cmd_watch(args) -> int:
                             lbl = (find_account(nxt) or {}).get("label", nxt)
                             log(f"hotswap[codex]: {cur_cx} → {nxt} ({cw['label']} {cw['pct']:.0f}%)")
                             notify("🔫 claude-magazine",
-                                   f"Codex {cw['label']} {cw['pct']:.0f}% → {lbl} に装填")
+                                   f"Codex {cw['label']} {cw['pct']:.0f}% → {lbl} に装填"
+                                   + ("（開いているセッションは次のターンから）"
+                                      if codex_session_recently_active() else ""))
 
             # 2) usage API（低頻度の裏取り。429 ならその時点で上限確定）
             if not swapped and now() - last_api > args.api_interval:
@@ -2886,8 +2980,8 @@ Registering (the alias is what you type from then on):
     a = sub.add_parser("login", help=T("sign in to another account without touching the active one, and register it",
                                        "使用中の認証に触れずに別アカウントでログインし、登録する"))
     a.add_argument("provider", choices=["claude", "codex"])
-    a.add_argument("alias", metavar="ALIAS", help=T("alias for the account (an existing alias re-stores that account's credentials)",
-                                                    "このアカウントの alias（登録済み alias なら認証の入れ直し）"))
+    a.add_argument("alias", metavar="ALIAS", help=T("alias for the account (an existing alias for the same provider re-stores that account's credentials)",
+                                                    "このアカウントの alias（同じ provider の登録済み alias なら認証の入れ直し）"))
     a.set_defaults(func=cmd_login)
 
     a = sub.add_parser("update", help=T("re-store a registered account's credentials from the current sign-in",
