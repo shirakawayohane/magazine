@@ -15,7 +15,7 @@ Verification date: **2026-09-10**. Release: **v0.1.0** (early release).
 | Demo artifact | Five scenes, 40 seconds, 1200 × 760. Captured from the implementation; rendering rejects clipped text. The static preview was visually inspected |
 
 The initial CI run exposed a macOS Bash variable-expansion failure in the installer
-and a Windows non-UTF-8 log-writing failure during credential switching. Both were
+and Windows non-UTF-8 log-writing and PowerShell 5.1 script-parsing failures. These were
 fixed and rechecked in CI. The suite deliberately leaves Windows' default text locale
 in place so that adding `PYTHONUTF8=1` cannot hide application encoding problems.
 

@@ -1,12 +1,12 @@
-# magazine の常駐監視を Windows のタスクとして登録する（ログオン時に起動）。
+# Register magazine's background monitor to start at logon.
 #   powershell -ExecutionPolicy Bypass -File windows\register-task.ps1
-# 解除:
+# Remove:
 #   Unregister-ScheduledTask -TaskName magazine-watch -Confirm:$false
 $ErrorActionPreference = "Stop"
 
 $mag = Join-Path $env:USERPROFILE ".local\share\magazine\mag.py"
 if (-not (Test-Path $mag)) { $mag = Join-Path $PSScriptRoot "..\mag.py" }
-if (-not (Test-Path $mag)) { throw "mag.py が見つかりません" }
+if (-not (Test-Path $mag)) { throw "mag.py was not found" }
 
 $py = (Get-Command pythonw.exe -ErrorAction SilentlyContinue).Source
 if (-not $py) { $py = (Get-Command python.exe).Source }
@@ -18,4 +18,4 @@ $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
 
 Register-ScheduledTask -TaskName "magazine-watch" -Action $action -Trigger $trigger `
     -Settings $settings -Description "Switch AI subscription accounts before they hit a limit" -Force | Out-Null
-Write-Host "登録しました: magazine-watch（ログオン時に起動）"
+Write-Host "Registered magazine-watch (starts at logon)."
