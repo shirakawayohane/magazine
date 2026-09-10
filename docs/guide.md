@@ -102,6 +102,25 @@ Codex usage depends on recorded events. An account can show “never observed”
 has been used, or until an explicit refresh succeeds. Previously observed values are
 marked with a timestamp and can be stale.
 
+Both `mag status` and `mag limits` reuse the last saved Codex usage when no newer
+reading is available, including for inactive accounts and just after switching back.
+They label it “last seen” / “current usage unknown”; the percentage is not reset to
+zero when its recorded reset time passes. Observation timestamps come from the Codex
+record, not the time you display it. Older snapshots saved by previous magazine versions
+retain their original timestamps, which may represent when magazine read the record.
+An explicit `mag limits --refresh` failure keeps the previous value alongside the error.
+`mag status --quick` still skips usage reads.
+
+Usage snapshots share the existing account-specific `state.json` storage. Switching
+away also saves available usage before replacing the active credentials, provided the
+active account matches magazine's tracked account. This uses the existing local session
+reader, not an extra provider request. Its cost is one directory traversal and metadata
+lookup per session file, sorting that list, then reading at most the 20 most recently
+modified JSONL files. Inactive accounts only read their saved snapshots. Historical
+snapshots are for display, not evidence of current availability or an automatic-switch
+decision. The existing session reader filters records by switch time; it does not prove
+account ownership for concurrent Codex processes left running across a switch.
+
 The Claude usage endpoint and credential storage details can change independently of
 magazine. A usage endpoint returning HTTP 429 is treated as unavailable information,
 not proof that inference is blocked. Model-specific weekly usage is displayed separately

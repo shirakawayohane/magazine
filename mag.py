@@ -749,6 +749,30 @@ def codex_ensure_fresh(slug: str | None, auth: dict) -> dict:
     return new
 
 
+def codex_sync_live() -> str | None:
+    """現用の auth.json を、持ち主の保管スロットへ書き戻す。
+
+    codex 本体もトークンを更新するので、その瞬間に保管庫のスナップショットは
+    失効する。現用を上書きする前にここを通しておかないと、切り替えて戻った
+    ときに死んだ弾を掴む。戻り値は持ち主の slug。
+    """
+    live = codex_live_auth() or {}
+    rt = (live.get("tokens") or {}).get("refresh_token")
+    if not rt:
+        return None
+    accs = accounts_of("codex")
+    for a in accs:
+        if ((codex_stored_auth(a["slug"]) or {}).get("tokens") or {}).get("refresh_token") == rt:
+            return a["slug"]          # 保管庫は既に最新
+    email = (codex_identity(live).get("email") or "").lower()
+    for a in accs:
+        if email and (a.get("email") or "").lower() == email:
+            codex_store_auth(a["slug"], live)
+            log(f"sync: {a['slug']} の保管トークンを現用の最新版に更新（rotation 追従）")
+            return a["slug"]
+    return None
+
+
 CODEX_SESSIONS_DIR = os.path.expanduser("~/.codex/sessions")
 
 
@@ -1090,29 +1114,11 @@ def reconcile_current() -> dict:
                 log(f"reconcile: claude の現在弾を {a['slug']} に修正")
                 break
 
-    cauth = codex_live_auth() or {}
-    ctok = (cauth.get("tokens") or {}).get("refresh_token")
-    if ctok:
-        matched = None
-        for a in accounts_of("codex"):
-            st = (codex_stored_auth(a["slug"]) or {}).get("tokens") or {}
-            if st.get("refresh_token") == ctok:
-                matched = a["slug"]
-                break
-        if matched is None:
-            # OpenAI も refresh token を使い捨てにするため、保管したスナップショットは
-            # 本体が更新した時点で失効する。現用の中身で保管庫を上書きして追従する。
-            live_id = codex_identity(cauth)
-            for a in accounts_of("codex"):
-                if (a.get("email") or "").lower() == (live_id.get("email") or "").lower():
-                    codex_store_auth(a["slug"], cauth)
-                    matched = a["slug"]
-                    log(f"sync: {a['slug']} の保管トークンを現用の最新版に更新（rotation 追従）")
-                    break
-        if matched and get_current("codex") != matched:
-            set_current("codex", matched)
-            fixed["codex"] = matched
-            log(f"reconcile: codex の現在弾を {matched} に修正")
+    matched = codex_sync_live()   # codex も rotation で保管庫が古びる
+    if matched and get_current("codex") != matched:
+        set_current("codex", matched)
+        fixed["codex"] = matched
+        log(f"reconcile: codex の現在弾を {matched} に修正")
     return fixed
 
 
@@ -1235,8 +1241,13 @@ def do_load(slug: str, reason: str = "") -> bool:
         if not auth:
             print(T(f"✗ {name}: no stored credential in keychain", f"✗ {name}: Keychain に認証情報がありません"), file=sys.stderr)
             return False
+        outgoing = codex_sync_live()
         auth = codex_ensure_fresh(slug, auth)
         try:
+            # 認証情報と state の持ち主が一致する場合だけ、切替前の記録を保存する。
+            # 手動ログインなどで食い違っている場合は他アカウントへの誤帰属を避ける。
+            if outgoing and outgoing == get_current("codex"):
+                codex_usage_snapshot(outgoing)
             codex_install_auth(auth)
         except (RuntimeError, OSError) as e:
             print(T(f"✗ failed to activate {name}: {e}", f"✗ {name} への切り替えに失敗: {e}"), file=sys.stderr)
@@ -1661,22 +1672,14 @@ def _print_magazine(accs: list, prov: str, args) -> int:
                 auth = codex_stored_auth(slug)
                 if not auth:
                     print(T("    ✗ no stored credential in keychain", "    ✗ Keychain に認証情報がありません"))
-                elif slug == cur:
-                    since = (state().get("last_switch_by") or {}).get("codex")
-                    lim = codex_live_limits(only_after=since)
-                    if not lim:
-                        print(T("    no usage recorded yet (run codex once and it appears)",
-                              "    残量の記録なし（codex で1回やり取りすると出ます）"))
-                    else:
-                        for w in lim["windows"]:
-                            print(f"    {w['label']:<10}{bar(w['pct'])}   reset {fmt_when(w['resets_at'])}")
-                        if lim.get("reached"):
-                            print(T(f"    ⛔ limit reached: {lim['reached']}", f"    ⛔ 上限到達: {lim['reached']}"))
-                        print(T(f"    (recorded at {datetime.fromtimestamp(lim['ts']):%m/%d %H:%M})",
-                                f"    （{datetime.fromtimestamp(lim['ts']):%m/%d %H:%M} 時点の記録）"))
-                else:
-                    print(T("    usage readable only while active (codex records it at runtime)",
-                          "    残量は使用中のみ取得可（codex は実行時に記録するため）"))
+                usage = codex_usage_snapshot(slug)
+                if usage["note"]:
+                    print(f"    {usage['note']}")
+                for w in usage["windows"]:
+                    print(f"    {w['label']:<10}{bar(w['pct'])}   reset {fmt_usage_reset(w, usage)}")
+                if usage.get("reached"):
+                    print(T(f"    ⛔ limit reached: {usage['reached']}", f"    ⛔ 上限到達: {usage['reached']}"))
+                print_usage_timestamp(usage, indent="    ")
             continue
         p = probe(slug)
         print(line)
@@ -1717,12 +1720,75 @@ def record_limits(slug: str, data: dict) -> None:
     控えておかないと他の弾の残量を二度と表示できなくなる。
     """
     s = state()
-    s.setdefault("limits", {})[slug] = {**data, "ts": now()}
+    s.setdefault("limits", {})[slug] = {**data, "ts": data.get("ts") or now()}
     save_state(s)
 
 
 def known_limits(slug: str) -> dict | None:
     return (state().get("limits") or {}).get(slug)
+
+
+def codex_usage_snapshot(slug: str, refresh: bool = False) -> dict:
+    """表示用の観測値。取得できない場合も、同じアカウントの前回値を残す。
+
+    自動切替の可否判定には使わない。通常表示では追加のリクエストを送らない。
+    """
+    row = {"windows": [], "note": None}
+    old = known_limits(slug)
+    lim = None
+    if get_current("codex") == slug:
+        since = (state().get("last_switch_by") or {}).get("codex")
+        lim = codex_live_limits(only_after=since)
+        if not lim:
+            row["note"] = T("no usage recorded yet (run codex once)",
+                            "残量の記録なし（codex で1回やり取りすると出ます）")
+    elif refresh:
+        lim = codex_probe(slug)
+        if lim and lim.get("dead"):
+            row["note"] = T("needs re-login (refresh token revoked)", "要再ログイン（refresh token 失効）")
+        elif not lim:
+            row["note"] = T("could not read usage", "残量を取得できませんでした")
+
+    # 明示更新で保存した値より古いセッション記録に、前回値を巻き戻さない。
+    if (lim and lim.get("ts") and old and old.get("windows")
+            and (old.get("ts") or 0) > lim["ts"]):
+        lim = None
+    if lim and not lim.get("dead") and lim.get("windows"):
+        row["windows"] = [{"label": w["label"], "pct": w["pct"],
+                           "resets_at": w.get("resets_at")} for w in lim["windows"]]
+        row["reached"] = lim.get("reached")
+        row["observed_ts"] = lim.get("ts") or now()
+        record_limits(slug, {"windows": row["windows"], "ts": row["observed_ts"]})
+    else:
+        if old and old.get("windows"):
+            row["windows"] = old["windows"]
+            row["stale_ts"] = old.get("ts")
+            # 未観測という案内は前回値がある場合には不要。更新失敗の理由は残す。
+            if not refresh or get_current("codex") == slug:
+                row["note"] = None
+        elif not row["note"]:
+            row["note"] = T("never observed (use mag limits --refresh to measure)",
+                            "未観測（mag limits --refresh で実測できます）")
+    return row
+
+
+def fmt_usage_reset(window: dict, row: dict) -> str:
+    reset = window.get("resets_at")
+    if row.get("stale_ts") and reset and reset <= now():
+        return T("time passed; unverified", "予定時刻経過・未確認")
+    return fmt_when(reset)
+
+
+def print_usage_timestamp(row: dict, indent: str = "      ") -> None:
+    ts = row.get("stale_ts") or row.get("observed_ts")
+    if not ts:
+        return
+    at = f"{datetime.fromtimestamp(ts):%m/%d %H:%M}"
+    if row.get("stale_ts"):
+        text = T(f"(last seen {at}; current usage unknown)", f"(前回観測: {at} 時点・現在の使用量は不明)")
+    else:
+        text = T(f"(recorded at {at})", f"({at} 時点の記録)")
+    print(f"{indent}\033[2m{text}\033[0m")
 
 
 def collect_limits(parallel_fetch: bool = True, args_ns=None) -> list:
@@ -1776,34 +1842,7 @@ def collect_limits(parallel_fetch: bool = True, args_ns=None) -> list:
         row = {"provider": "codex", "slug": slug, "label": a.get("label", slug),
                "current": is_cur, "windows": [], "note": None,
                "cooldown": cooldown_left(slug)}
-        if is_cur:
-            since = (state().get("last_switch_by") or {}).get("codex")
-            lim = codex_live_limits(only_after=since)
-            if lim:
-                row["windows"] = [{"label": w["label"], "pct": w["pct"],
-                                   "resets_at": w["resets_at"]} for w in lim["windows"]]
-                row["reached"] = lim.get("reached")
-                record_limits(slug, {"windows": row["windows"]})
-            else:
-                row["note"] = T("no usage recorded yet (run codex once)", "残量の記録なし（codex で1回やり取りすると出ます）")
-        elif getattr(args_ns, "refresh", False):
-            # 現用でない弾も、使い捨ての CODEX_HOME で1回だけ問い合わせて実測する
-            got = codex_probe(slug)
-            if got and got.get("dead"):
-                row["note"] = T("needs re-login (refresh token revoked)", "要再ログイン（refresh token 失効）")
-            elif got:
-                row["windows"] = got["windows"]
-                row["reached"] = got.get("reached")
-                record_limits(slug, {"windows": row["windows"]})
-            else:
-                row["note"] = T("could not read usage", "残量を取得できませんでした")
-        else:
-            old = known_limits(slug)
-            if old:
-                row["windows"] = old.get("windows") or []
-                row["stale_ts"] = old.get("ts")
-            else:
-                row["note"] = T("never observed (use --refresh to measure)", "未観測（--refresh で実測できます）")
+        row.update(codex_usage_snapshot(slug, refresh=getattr(args_ns, "refresh", False)))
         rows.append(row)
     return rows
 
@@ -1839,14 +1878,14 @@ def cmd_limits(args) -> int:
                     head += T(f"  \033[31m⏳ limited → {fmt_when(cd['until'])}\033[0m",
                               f"  \033[31m⏳ 上限到達 → {fmt_when(cd['until'])}\033[0m")
             print(head)
-            if r.get("note") and not r["windows"]:
+            if r.get("note"):
                 print(f"      \033[2m{r['note']}\033[0m")
             for w in r["windows"]:
                 if r["current"]:
                     worst_overall = max(worst_overall, w["pct"] or 0)
                 dim = "\033[2m" if w.get("scoped") else ""
                 print(f"      {dim}{w['label']:<12}\033[0m {bar(w['pct'])}"
-                      f"   reset {fmt_when(w.get('resets_at'))}")
+                      f"   reset {fmt_usage_reset(w, r)}")
             mt = r.get("metered") or {}
             if mt.get("limit_reached"):
                 print(T("      \033[31m⛔ metered credits exhausted (org-capped) — this account just stops\033[0m",
@@ -1854,9 +1893,7 @@ def cmd_limits(args) -> int:
             elif mt.get("enabled"):
                 print(T("      \033[33m💸 metered billing ON — going over the plan window will cost money\033[0m",
                         "      \033[33m💸 従量課金が有効 — 枠を超えると課金されます\033[0m"))
-            if r.get("stale_ts"):
-                print(T(f"      \033[2m(last seen {datetime.fromtimestamp(r['stale_ts']):%m/%d %H:%M})\033[0m",
-                        f"      \033[2m(前回観測: {datetime.fromtimestamp(r['stale_ts']):%m/%d %H:%M} 時点)\033[0m"))
+            print_usage_timestamp(r)
             if r.get("reached"):
                 print(T(f"      \033[31m⛔ limit reached: {r['reached']}\033[0m",
                         f"      \033[31m⛔ 上限到達: {r['reached']}\033[0m"))
