@@ -38,5 +38,6 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          & ./windows/install.ps1
+          powershell -NoProfile -ExecutionPolicy Bypass -File windows/install.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & "$env:USERPROFILE/.local/bin/mag.cmd" --help
