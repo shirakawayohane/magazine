@@ -2232,22 +2232,26 @@ def wf_resume_prompt(wf: dict) -> str:
 def cmd_stalled(args) -> int:
     sessions = scan_sessions(args.hours, stalled_only=not args.all)
     if not sessions:
-        print(f"直近 {args.hours:.0f}h に上限で止まったセッションはありません。")
+        print(T(f"No sessions stopped by a limit in the last {args.hours:.0f}h.",
+                f"直近 {args.hours:.0f}h に上限で止まったセッションはありません。"))
         return 0
-    print(f"上限などで止まっているセッション: {len(sessions)} 件\n")
+    print(T(f"Sessions stopped by a limit or login error: {len(sessions)}\n",
+            f"上限などで止まっているセッション: {len(sessions)} 件\n"))
     for i, s in enumerate(sessions, 1):
         when = (s["timestamp"] or "")[:19].replace("T", " ")
         print(f"{i}. {s['session_id']}")
         print(f"   cwd    : {s['cwd'] or '?'}")
-        print(f"   停止   : {s['stalled_by'] or '(不明)'}   最終 {when}")
+        print(T(f"   reason : {s['stalled_by'] or 'unknown'}   last {when}",
+                f"   停止   : {s['stalled_by'] or '(不明)'}   最終 {when}"))
         if s["last_user"]:
-            print(f"   最後の指示: {s['last_user']}")
+            print(T(f"   task   : {s['last_user']}", f"   最後の指示: {s['last_user']}"))
         if s["workflow"]:
             wf = s["workflow"]
             cached = wf.get("cached_agents") or 0
-            saved = f"完了 {cached} エージェント分はキャッシュ再利用" if cached else "キャッシュなし"
+            saved = (T(f"{cached} completed agent results in journal", f"完了 {cached} エージェント分はキャッシュ再利用")
+                     if cached else T("no cached results", "キャッシュなし"))
             print(f"   ⚙ workflow: {wf['name']}  runId={wf['run_id']}  → {saved}")
-        print(f"   再開   : mag resume {s['session_id']}")
+        print(T(f"   resume : mag resume {s['session_id']}", f"   再開   : mag resume {s['session_id']}"))
         print()
     return 0
 
@@ -2750,6 +2754,12 @@ def cmd_install_statusline(args) -> int:
     """
     conf_dir = claude_config_dir()
     os.makedirs(conf_dir, exist_ok=True)
+    settings_path = os.path.join(conf_dir, "settings.json")
+    settings = read_json(settings_path, None) if os.path.exists(settings_path) else {}
+    if not isinstance(settings, dict):
+        print(T(f"✗ {settings_path} must contain a JSON object; left unchanged",
+                f"✗ {settings_path} は JSON オブジェクトである必要があります。変更しません"), file=sys.stderr)
+        return 1
     # このファイル自身の位置を使う。データ置き場（ROOT）とは別物。
     me = os.path.abspath(__file__)
     py = sys.executable or ("python" if IS_WINDOWS else "python3")
@@ -2762,7 +2772,7 @@ def cmd_install_statusline(args) -> int:
         script = f'#!/bin/bash\n# magazine 連携 statusLine\nexec "{py}" "{me}" statusline\n'
 
     if os.path.exists(path):
-        bak = path + f".bak.{int(now())}"
+        bak = path + f".bak.{time.time_ns()}"
         with open(path) as f:
             old = f.read()
         with open(bak, "w") as f:
@@ -2775,15 +2785,17 @@ def cmd_install_statusline(args) -> int:
         os.chmod(path, 0o755)
 
     # settings.json の statusLine もこのファイルを指すようにしておく
-    settings_path = os.path.join(conf_dir, "settings.json")
-    settings = read_json(settings_path, None)
-    if isinstance(settings, dict):
-        want = f'"{path}"' if IS_WINDOWS else f'bash "{path}"'
-        cur = (settings.get("statusLine") or {}).get("command")
-        if cur != want:
-            settings["statusLine"] = {"type": "command", "command": want}
-            write_json(settings_path, settings)
-            print(T("settings.json: statusLine updated", "settings.json の statusLine を更新"))
+    want = f'"{path}"' if IS_WINDOWS else f'bash "{path}"'
+    previous = settings.get("statusLine")
+    previous = previous if isinstance(previous, dict) else {}
+    if previous.get("command") != want or previous.get("type") != "command":
+        if os.path.exists(settings_path):
+            backup = settings_path + f".bak.{time.time_ns()}"
+            shutil.copy2(settings_path, backup)
+            print(T(f"backup: {backup}", f"バックアップ: {backup}"))
+        settings["statusLine"] = {**previous, "type": "command", "command": want}
+        write_json(settings_path, settings)
+        print(T("settings.json: statusLine updated", "settings.json の statusLine を更新"))
     print(T(f"✓ statusLine now goes through mag: {path}",
             f"✓ statusLine を mag 経由に接続: {path}"))
     return 0
@@ -2892,7 +2904,8 @@ Registering (the alias is what you type from then on):
     a = sub.add_parser("watch", help=T("daemon: switch before limits, without stopping sessions","常駐監視：セッションを止めずに事前切替"))
     a.add_argument("--interval", type=float, default=20.0, help="live 監視の間隔（秒）")
     a.add_argument("--api-interval", type=float, default=300.0, help="usage API の裏取り間隔（秒）")
-    a.add_argument("--threshold", type=float, default=None, help="切替する使用率（既定 98%%）")
+    a.add_argument("--threshold", type=float, default=None,
+                   help=T("usage percentage to switch at (default: 97%%)", "切替する使用率（既定 97%%）"))
     a.set_defaults(func=cmd_watch)
 
     a = sub.add_parser("stalled", help=T("list sessions stopped by a limit","上限で止まったセッションを一覧"))

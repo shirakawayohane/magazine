@@ -2,17 +2,16 @@ name: test
 
 on:
   push:
-    branches: [main]
+    branches: [main, docs/oss-launch]
   pull_request:
 
 jobs:
   test:
-    # macOS 専用のツールだが、テスト自体はキーチェーンにもネットワークにも触れないので
-    # Linux でも走る。両方で回して、うっかり環境に依存していないことを確かめる。
+    # Real OS runners; account and network access are replaced in tests.
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, ubuntu-latest]
+        os: [macos-latest, ubuntu-latest, windows-latest]
         python: ["3.10", "3.13"]
     runs-on: ${{ matrix.os }}
     steps:
@@ -23,6 +22,21 @@ jobs:
       - name: syntax
         run: python -m compileall -q mag.py
       - name: shell syntax
+        shell: bash
         run: bash -n install.sh
       - name: tests
         run: python -m unittest discover -s tests -v
+      - name: offline CLI walkthrough
+        run: python scripts/demo.py
+      - name: install from clone (macOS / Linux)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          bash install.sh < /dev/null
+          "$HOME/.local/bin/mag" --help
+      - name: install from clone (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & ./windows/install.ps1
+          & "$env:USERPROFILE/.local/bin/mag.cmd" --help

@@ -1,0 +1,38 @@
+name: Bug report
+description: Report a reproducible problem without sharing credentials.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: "Please use synthetic account names. Never attach tokens, auth files, raw journals, or unredacted logs. For credential exposure, use the private security report instead."
+  - type: input
+    id: version
+    attributes:
+      label: magazine release or commit
+      placeholder: v0.1.0
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: OS, Python version, and provider CLI version
+      placeholder: macOS 15, Python 3.13, Claude Code 2.x / Codex 0.x
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Include commands with account names replaced by examples.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: Additional details (optional, redact personal data)

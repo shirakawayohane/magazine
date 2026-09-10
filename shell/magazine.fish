@@ -8,10 +8,16 @@
 #
 # 無効化したいときは `command claude ...` か、このファイルを削除するだけ。
 
-function claude --description 'claude (magazine: pick an account first)'
-    set -l mag $HOME/.claude-magazine/mag.py
+function _magazine_has_accounts
+    set -l account_file $HOME/.config/magazine/accounts.json
+    if set -q MAGAZINE_HOME
+        set account_file $MAGAZINE_HOME/accounts.json
+    end
+    test -f "$account_file"; or test -f "$HOME/.claude-magazine/accounts.json"
+end
 
-    if not test -f $HOME/.claude-magazine/accounts.json
+function claude --description 'claude (magazine: pick an account first)'
+    if not _magazine_has_accounts
         command claude $argv
         return $status
     end
@@ -23,15 +29,13 @@ function claude --description 'claude (magazine: pick an account first)'
     end
 
     # ネットワークを叩かずローカルの状態だけで判断する（起動を遅らせない）
-    python3 $mag auto --no-probe >/dev/null 2>&1
+    command mag auto --no-probe >/dev/null 2>&1
     command claude $argv
     return $status
 end
 
 function codex --description 'codex (magazine: pick an account first)'
-    set -l mag $HOME/.claude-magazine/mag.py
-
-    if not test -f $HOME/.claude-magazine/accounts.json
+    if not _magazine_has_accounts
         command codex $argv
         return $status
     end
@@ -41,7 +45,7 @@ function codex --description 'codex (magazine: pick an account first)'
         return $status
     end
 
-    python3 $mag auto --no-probe --provider codex >/dev/null 2>&1
+    command mag auto --no-probe --provider codex >/dev/null 2>&1
     command codex $argv
     return $status
 end

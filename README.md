@@ -1,289 +1,198 @@
 # magazine
 
-Keep coding when your AI subscription hits its limit.
+**Your Claude Code and Codex accounts, in one CLI.**
 
-`magazine` holds several **Claude Code** and **Codex (ChatGPT)** subscriptions in one clip and
-chambers the next one when the current account runs dry — without killing the session you are in.
+Check usage across your subscriptions, switch accounts by name, and find Claude Code
+sessions interrupted by a limit. Built for developers who already manage multiple
+accounts of their own.
 
-```
-$ mag limits
+[![Tests](https://github.com/shirakawayohane/magazine/actions/workflows/test.yml/badge.svg)](https://github.com/shirakawayohane/magazine/actions/workflows/test.yml)
+[![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[Install](#install) · [Quick start](#quick-start) · [Guide](docs/guide.md) · [Report a bug](https://github.com/shirakawayohane/magazine/issues/new/choose)
 
-🔵 Claude Code
- ▶ main
-      5時間         ████████░░  85.0%   reset 07/27 02:39 (残り30m)
-      週次          ███░░░░░░░  32.0%   reset 08/02 11:59 (残り153h50m)
-   sub
-      5時間         ░░░░░░░░░░   0.0%   reset 07/27 05:00 (残り2h50m)
-      週次          █████████░  91.0%   reset 07/27 05:00 (残り2h50m)
-      週次/Fable    ██████████ 100.0%   reset 07/27 05:00 (残り2h50m)
+![40-second offline demo: view Claude Code and Codex usage, switch to spare, find an interrupted session, and preview its resume command](docs/assets/demo.gif)
 
-🟢 Codex / ChatGPT
- ▶ codex-main
-      7日枠         ███████░░░  74.0%   reset 08/02 16:41 (残り158h32m)
-```
+*Real magazine commands with synthetic accounts and usage data. The final step is a
+resume preview, not a live AI session. [Text version and reproduction](docs/demo.md).*
 
-## Why another one of these?
+## What it does
 
-There are already good account switchers. Before adding one more, here is where this one
-actually differs — and where it does not.
+- **One usage view.** See Claude Code and Codex accounts together, with usage windows,
+  reset times, and the active account for each provider.
+- **Switch by name.** Use `mag use spare`, or let `mag watch` select the next account
+  when reported usage reaches a threshold.
+- **Find interrupted work.** `mag stalled` locates Claude Code sessions with recorded
+  limit or login errors. `mag resume` selects an account and opens the existing session.
+- **Small install.** One Python script, standard library only. No proxy server or
+  extra Python packages. Optional shell integration checks accounts before launching
+  the usual CLI.
 
-|                                   | magazine | [cux] | [clauth] | [claude-swap] | [teamclaude] | [claude-account-switcher] | [codex-rotator] |
-| --------------------------------- | :------: | :---: | :------: | :-----------: | :----------: | :-----------------------: | :-------------: |
-| Claude Code                       |    ✅    |  ✅   |    ✅    |      ✅       |      ✅      |            ✅             |       —         |
-| Codex (ChatGPT)                   |    ✅    |   —   |    —     |       —       |      —       |            ✅             |      ✅         |
-| **Both, from one CLI**            |  **✅**  |   —   |    —     |       —       |      —       |       GUI menu bar        |       —         |
-| **Resumes interrupted workflows** |  **✅**  |   —   |    —     |       —       |      —       |             —             |       —         |
-| **Finds sessions already dead**   |  **✅**  |   —   |    —     |       —       |      —       |             —             |       —         |
-| **Reads usage of inactive accts** |  **✅**  |   —   |    —     |       —       |      —       |            ✅             |       —         |
-| No proxy, no wrapper, no restart  |    ✅    | wraps |    ✅    |      ✅       |   proxy      |            ✅             |      ✅         |
+| | Claude Code | Codex / ChatGPT |
+| --- | --- | --- |
+| Account registration and switching | Yes | Yes; subscription login with file storage |
+| Usage | Provider usage endpoint and status-line data | Local session records; optional refresh request |
+| Switching a running session | Can be picked up by Claude Code; timing depends on its credential cache/version | Start Codex again to use the selected account |
+| Interrupted-session discovery and resume | Yes, for recognized local session records | Not implemented |
 
-If you only use Claude Code, [cux] and [clauth] are mature and you should look at them first.
-If you want a menu-bar GUI covering both, use [claude-account-switcher].
-
-**Use `magazine` if you live in the terminal, run *both* Claude Code and Codex, and lose real
-work when a limit lands mid-task.**
-
-[cux]: https://github.com/inulute/cux
-[clauth]: https://github.com/uwuclxdy/clauth
-[claude-swap]: https://github.com/realiti4/claude-swap
-[teamclaude]: https://github.com/KarpelesLab/teamclaude
-[claude-account-switcher]: https://github.com/Symbioose/claude-account-switcher
-[codex-rotator]: https://github.com/PhanTrongGiap/codex-rotator
-
-## The two things it does that others don't
-
-### 1. It gives you back the work a limit interrupted
-
-When a limit lands in the middle of a multi-agent `Workflow`, the completed agents are not lost —
-they are on disk in `journal.jsonl`, keyed by a hash of each agent's prompt. `magazine` finds the
-interrupted run and resumes it by `runId`, so finished agents replay from cache instead of running again.
-
-Measured on a real interrupted run:
-
-| | agents | output tokens |
-| --- | ---: | ---: |
-| first run | 3 | 51,847 |
-| resumed (+1 new agent) | 4 | **17,282** |
-
-Only the new agent actually ran. The three completed ones replayed from cache.
-
-```console
-$ mag stalled
-上限などで止まっているセッション: 2 件
-
-1. 58f72cbd-3be9-45f5-bd7d-349ea5f11ef3
-   cwd    : ~/src/my-project
-   停止   : hit your session limit   最終 2026-07-26 19:13
-   ⚙ workflow: design-pass  runId=wf_af56b4bf-9a1  → 完了 11 エージェント分はキャッシュ再利用
-   再開   : mag resume 58f72cbd
-
-$ mag resume 58f72cbd     # swaps in a live account, resumes, continues the workflow
-```
-
-### 2. Swapping does not restart your session, and does not touch the CLI
-
-Claude Code re-reads the keychain on each request. `magazine` rewrites only the
-`claudeAiOauth` slot, and every session already running — including background workflows —
-continues on the new account. Nothing is killed, nothing is resumed, nothing is lost.
-
-That is the whole mechanism, and it is deliberately **outside** the CLI:
-
-- `mag watch` is a daemon. It never attaches to your terminal or to any `claude` process.
-- Usage comes from the **statusLine hook** — a documented extension point — so reading it
-  costs no extra API calls and requires no scraping.
-- The shell wrapper only runs `mag auto --no-probe` (~0.09s, no network) before handing off
-  to the real binary with `exec`. Your terminal talks to `claude` directly, as it always did.
-
-Nothing sits between your keyboard and the CLI. That matters more than it sounds: wrapping a
-TUI in a pty means brokering terminal capability negotiation and keyboard protocols, and
-getting any of it subtly wrong breaks arrow keys and multi-line input. `magazine` does not
-take that risk on the default path.
-
-> Codex swaps take effect from the next `codex` start, since `~/.codex/auth.json` is read at
-> startup. The daemon still tracks Codex usage (from its session journals) and swaps ahead of
-> the limit, so the next start already has a fresh account.
-
-This tool does one thing: switch accounts and show you what is left. It does not wrap, watch,
-restart, or otherwise manage your CLI sessions — an earlier version tried to, and brokering
-terminal capability negotiation on the CLI's behalf broke arrow keys and multi-line input in
-ways that kept resurfacing. That approach is gone.
-
-## Correctness notes
-
-Rate-limit data is easy to read wrong. These are mistakes `magazine` makes a point of not making —
-each one was found by testing against live accounts, and each one costs you a usable account if you get it wrong.
-
-- **A 429 from the usage endpoint does not mean the account is out.**
-  `/api/oauth/usage` is itself rate-limited and returns 429 while inference still works fine.
-  Treating that as "account exhausted" benches a perfectly good account. `magazine` only trusts
-  inference-side signals (statusLine `rate_limits`, real limit messages) to declare an account dry.
-- **A model-scoped weekly limit is not an account-wide limit.**
-  `weekly_scoped` at 100% for one model (e.g. Fable) leaves every other model usable.
-  Folding it into the account total retires an account that still has ~9% of its real weekly quota left.
-- **`claude auth status` caches its profile.** After a keychain-level swap it keeps reporting the
-  previous account. `magazine` identifies the live account by matching the refresh token, not by asking the CLI.
-- **Refresh tokens rotate.** A credential snapshot taken at registration dies as soon as the CLI
-  refreshes that account. `magazine` re-syncs the stored copy whenever it sees the account live,
-  and flags a dead one as `要再ログイン` instead of silently chambering a round that 401s.
-
-Each of those is pinned by a test, and each test was checked by deliberately reintroducing the
-bug to confirm the test fails. A test that cannot fail is not protecting anything.
-
-## Tests
-
-```sh
-./tests/run.sh
-```
-
-41 tests, no dependencies, and they never touch the real keychain, your accounts, or the
-network — state goes to a temp `MAGAZINE_HOME` and anything reaching outward is substituted.
-CI runs them on macOS and Linux, on Python 3.10 and 3.13.
+Switching stays within each provider. It does not move a Claude conversation into
+Codex, increase a subscription's allowance, or guarantee uninterrupted work.
+See [compatibility and verification](docs/verification.md) for what has actually been tested.
 
 ## Install
 
-Needs Python 3.10+ (the system one is fine) and `claude` and/or `codex` on your `PATH`.
-No other dependencies; the whole thing is one standard-library script.
+Requires **Python 3.10+**, Git, and Claude Code and/or Codex.
+On macOS/Linux, the Python command must be `python3`; on Windows, `python.exe`.
+
+Clone the first release so you can inspect the installer before running it:
+
+```sh
+git clone --branch v0.1.0 --depth 1 https://github.com/shirakawayohane/magazine.git
+cd magazine
+```
 
 **macOS / Linux**
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/shirakawayohane/magazine/main/install.sh | bash
+./install.sh
 ```
 
-**Windows** (PowerShell)
+If `mag` is not found, add the installed command directory to your current shell:
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+**Windows — PowerShell**
 
 ```powershell
-irm https://raw.githubusercontent.com/shirakawayohane/magazine/main/windows/install.ps1 | iex
+powershell -ExecutionPolicy Bypass -File windows\install.ps1
 ```
 
-Or from a clone, which is the same script and lets you read it first:
+Open a new terminal after installation so the updated user PATH takes effect.
+
+The installer creates the `mag` command. If a Claude settings directory is present,
+it installs magazine's status line, backing up the previous script and settings before
+replacing them. Your existing status-line command will be replaced, not combined.
+Shell integration and background monitoring are optional.
+[Installation details, updates, and uninstall](docs/guide.md#installation-and-updates).
+
+## Quick start
+
+Register the account you are already using. Choose the provider you need:
 
 ```sh
-git clone https://github.com/shirakawayohane/magazine && cd magazine && ./install.sh
-```
-
-### Where credentials live
-
-macOS keeps them in the login keychain. Linux and Windows have no equivalent that is present
-everywhere, so they go in a `0600` file under your data directory — on Windows the ACL is
-narrowed to your user as well. That is the same protection Claude Code itself gives them:
-outside macOS it stores your login in plain `~/.claude/.credentials.json`, and `magazine`
-reads and writes that same file rather than inventing a second scheme.
-
-| | credential store | daemon |
-| --- | --- | --- |
-| macOS | login keychain | launchd |
-| Linux | `0600` file | systemd user unit |
-| Windows | `0600` file + ACL | Scheduled Task (`windows\register-task.ps1`) |
-
-The installer puts `mag` on your `PATH` and wires the Claude Code statusLine hook, so usage is
-readable without spending extra API calls. It then asks before touching anything else — the
-`watch` daemon and the shell integration are both optional, and piping into `bash` skips both
-rather than deciding for you. Re-run it any time to enable them or to update.
-
-Files land in three places: the source in `~/.local/share/magazine`, the command in
-`~/.local/bin/mag`, and your accounts in `~/.config/magazine` (`MAGAZINE_HOME` overrides it).
-
-### Uninstall
-
-```sh
-rm -rf ~/.local/share/magazine ~/.local/bin/mag ~/.config/magazine
-rm -f ~/.config/fish/conf.d/magazine.fish
-launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.magazine.watch.plist 2>/dev/null
-rm -f ~/Library/LaunchAgents/com.magazine.watch.plist
-security delete-generic-password -s claude-magazine       2>/dev/null   # per account
-security delete-generic-password -s claude-magazine-codex 2>/dev/null   # per account
-```
-
-Your `claude` / `codex` logins are untouched by any of this — whichever account was active
-stays active.
-
-## Usage
-
-```sh
-# register the account you are logged into right now.
-# the alias is what you type from then on; it must be unique across providers.
-claude auth login          # then:
+# Claude Code: sign in first if necessary, then save the current account
+claude auth login
 mag add main
 
-codex login                # then:
+# Codex: ChatGPT subscription login, using the default file credential store
+codex login
 mag add codex-main --provider codex
-
-# add more accounts without touching the one you are using: mag runs the
-# CLI's own login in a throwaway profile and keeps only the credential.
-mag login claude sub
-mag login codex codex-sub
-mag login claude main      # an existing alias re-stores that account's credentials
-
-# signed in to a registered account again the normal way (token expired, reinstalled, ...)?
-mag update main
-
-# look at everything at once
-mag limits
-mag limits --json          # for scripts / status bars
-
-# move around
-mag next                   # advance the clip
-mag use sub                # chamber a specific one (a unique prefix of the alias is enough)
-mag rename sub work        # change an alias; credentials stay put
-mag status                 # per-account detail
-
-# nothing to do — with the daemon running, just use claude / codex normally.
-# the shell wrapper only picks an account before handing off to the real binary.
-
-# recover what a limit interrupted
-mag stalled
-mag resume <session-id>
-
-# background daemon: swap before you hit the wall
-mag watch
-mag doctor                 # check the install
 ```
 
-### How rotation picks the next account
+**Codex prerequisite:** this release reads the default `auth.json` location.
+Custom `CODEX_HOME`, keyring-only storage, and API-key accounts are not supported.
+Check the [Codex setup notes](docs/guide.md#codex-setup) before registering an account.
 
-Accounts advance in registration order (a clip, not a load balancer), so usage concentrates on
-one account at a time and your weekly consumption stays legible. Rotation is per-provider:
-Claude accounts cycle among Claude accounts, Codex among Codex.
+Add another account through the CLI's normal login flow in a temporary profile:
 
-An account is skipped when it is in cooldown (a real limit was observed), or when its credential
-is dead. Reaching a usage threshold advances the clip but does **not** bench the account — its
-remaining quota is still there next time around.
+```sh
+mag login claude spare
+# Or: mag login codex codex-spare
 
-## Configuration
+mag limits
+mag use spare
+```
 
-`~/.claude-magazine/config.json` — every field is optional.
+Use unique names across both providers. `mag login` leaves the active account in place;
+`mag use` changes it. For Codex, restart the CLI after switching.
 
-| key | default | meaning |
-| --- | --- | --- |
-| `hotswap_threshold` | `98.0` | usage % at which `watch` advances the clip |
-| `five_hour_threshold` | `99.5` | usage % at which a run wrapper advances |
-| `seven_day_threshold` | `99.5` | same, for the weekly window |
-| `warm_threshold` | `50.0` | usage % at which the next account is validated ahead of time |
-| `warm_model` | `claude-haiku-4-5-20251001` | model used for that validation ping |
-| `min_switch_interval` | `20` | seconds; guards against swap loops |
+### Optional: switch as usage approaches its limit
 
-## Where things live
+```sh
+mag watch
+```
 
-| path | what |
+Keep this terminal open, or enable background monitoring through the installer.
+The default switching threshold is **97%**. Detection depends on available usage data;
+it is not a spending cap. The monitor can make a small Claude request to pre-check a
+spare account. [Network access and usage costs](docs/guide.md#usage-data-and-network-access).
+
+### Recover a stopped Claude Code session
+
+```sh
+mag stalled
+mag resume <session-id> --dry-run   # inspect what would be launched
+mag resume <session-id>            # select an account and open the session
+```
+
+The session must have a recognizable limit/login message in its local transcript.
+Specialized Workflow recovery also requires the original runtime and its journal
+format; magazine does not itself cache or replay agent results.
+[How recovery works](docs/guide.md#session-recovery).
+
+## Common commands
+
+| Command | Use it to |
 | --- | --- |
-| keychain `Claude Code-credentials` | the live Claude slot (owned by Claude Code) |
-| keychain `claude-magazine` | stored Claude accounts |
-| keychain `claude-magazine-codex` | stored Codex accounts |
-| `~/.codex/auth.json` | the live Codex slot (owned by Codex) |
-| `~/.claude-magazine/accounts.json` | the clip: order, labels, providers |
-| `~/.claude-magazine/state.json` | current round, cooldowns, last-seen usage |
-| `~/.claude-magazine/logs/mag.log` | every swap, with its reason |
+| `mag limits` | Read usage for registered accounts |
+| `mag limits --json` | Read the same information as JSON |
+| `mag next` | Select the next Claude account |
+| `mag next --provider codex` | Select the next Codex account |
+| `mag use <name>` | Activate an account by its unique name |
+| `mag update <name>` | Re-save credentials after signing in again |
+| `mag rename <old> <new>` | Change an account name |
+| `mag remove <name>` | Remove a saved account |
+| `mag install-statusline` | Install or repair Claude status-line integration |
+| `mag doctor` | Inspect setup; currently includes Claude checks even on Codex-only installs |
 
-Credentials are only ever held in the macOS keychain. `magazine` writes tokens to disk in exactly
-one place — `~/.codex/auth.json`, because that is the file Codex itself reads — with mode `0600`.
+For English output, set `MAGAZINE_LANG=en`; Japanese is also supported.
+Some installer and diagnostic messages remain Japanese in this early release.
 
-## A word on fairness
+## Credentials and trust
 
-This rotates between subscriptions **you pay for**, on one machine, for one person. That is the
-only thing it is built for. Sharing one subscription across people, or running accounts you do not
-pay for, is against the providers' terms — and this tool will not help you do it.
+| Platform | Saved accounts |
+| --- | --- |
+| macOS, with the `security` command available | Login Keychain |
+| Linux / macOS without Keychain support | Local files with owner-only permissions |
+| Windows | Local files; magazine attempts to restrict the ACL to the current user |
+
+The active login is also written to the location the provider CLI uses.
+File storage is not encryption. Login flows can create temporary credential files.
+[Storage locations, communications, and reporting security issues](SECURITY.md).
+
+magazine is an independent MIT-licensed project, not affiliated with Anthropic or
+OpenAI. It is intended for your own accounts. You remain responsible for each
+provider's terms and any organization policies; paying for accounts is not by itself
+a guarantee that every use is permitted.
+
+## Alternatives
+
+Other projects solve overlapping problems. As of **2026-09-10**, their documentation describes:
+
+| Project | Documented focus |
+| --- | --- |
+| [cc-swap](https://github.com/errhythm/cc-swap) | Claude Code and Codex account/usage management, automatic switching, and a terminal dashboard |
+| [subswapper](https://github.com/lawzava/subswapper) | Claude Code and Codex subscription management with account selection and isolated profiles |
+
+These are descriptions from the linked projects, not comparative benchmarks.
+Choose magazine if its small Python CLI and Claude session-recovery helpers fit your
+workflow. No claim of feature exclusivity is intended.
+
+## Contributing
+
+[Bug reports and focused pull requests are welcome](CONTRIBUTING.md).
+Run the offline checks from a clone:
+
+```sh
+python3 -m unittest discover -s tests -v
+python3 scripts/demo.py
+```
+
+Tests use temporary data and substitute external account/network operations.
+They do not establish that every provider version or login environment is compatible.
+[Verification details](docs/verification.md).
 
 ## License
 
-MIT
+[MIT](LICENSE).

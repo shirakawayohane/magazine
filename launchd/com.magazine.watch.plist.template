@@ -6,7 +6,7 @@
     <string>com.magazine.watch</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/python3</string>
+        <string>__PYTHON__</string>
         <string>__MAG__</string>
         <string>watch</string>
     </array>
@@ -15,9 +15,9 @@
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>__HOME__/.claude-magazine/logs/watch.out.log</string>
+    <string>__LOG_DIR__/watch.out.log</string>
     <key>StandardErrorPath</key>
-    <string>__HOME__/.claude-magazine/logs/watch.err.log</string>
+    <string>__LOG_DIR__/watch.err.log</string>
     <key>ProcessType</key>
     <string>Background</string>
     <key>ThrottleInterval</key>

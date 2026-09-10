@@ -1,0 +1,37 @@
+[
+  {
+    "title": "01 / See every account",
+    "command": "mag limits",
+    "output": "🔵 Claude Code\n ▶ main\n      5-hour       ██████████  97.0%   reset in 2h\n      weekly       ████░░░░░░  35.0%   reset ?\n   spare\n      5-hour       █░░░░░░░░░  12.0%   reset in 2h\n      weekly       █░░░░░░░░░   8.0%   reset ?\n\n🟢 Codex / ChatGPT\n ▶ codex-main\n      weekly       ████░░░░░░  42.0%   reset in 2h",
+    "seconds": 9,
+    "note": "Synthetic accounts. Real command output. No network."
+  },
+  {
+    "title": "02 / Switch by name",
+    "command": "mag use spare",
+    "output": "🔁 switched to: spare (spare@example.com)",
+    "seconds": 6,
+    "note": "Claude Code can pick up changed credentials; timing depends on its version."
+  },
+  {
+    "title": "03 / Check the active account",
+    "command": "mag limits",
+    "output": "🔵 Claude Code\n   main\n      5-hour       ██████████  97.0%   reset in 2h\n      weekly       ████░░░░░░  35.0%   reset ?\n ▶ spare\n      5-hour       █░░░░░░░░░  12.0%   reset in 2h\n      weekly       █░░░░░░░░░   8.0%   reset ?\n\n🟢 Codex / ChatGPT\n ▶ codex-main\n      weekly       ████░░░░░░  42.0%   reset in 2h",
+    "seconds": 9,
+    "note": "The marker moves to spare. Claude and Codex rotate separately."
+  },
+  {
+    "title": "04 / Find interrupted work",
+    "command": "mag stalled",
+    "output": "Sessions stopped by a limit or login error: 1\n\n1. demo-session\n   cwd    : /demo/project\n   reason : hit your session limit   last 2026-09-10 11:58:00\n   resume : mag resume demo-session",
+    "seconds": 8,
+    "note": "Session discovery shown with a synthetic Claude Code journal."
+  },
+  {
+    "title": "05 / Preview the resume command",
+    "command": "mag resume demo-session --dry-run",
+    "output": "[dry-run] claude --resume demo-session",
+    "seconds": 8,
+    "note": "Preview only. Codex switches require a new Codex launch."
+  }
+]

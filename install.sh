@@ -23,6 +23,7 @@ case "$OS" in
   *)      die "未対応の環境です: $OS（Windows は windows\\install.ps1 を使ってください）" ;;
 esac
 command -v python3 >/dev/null || die "python3 が必要です"
+python3 -c 'import sys; sys.exit(sys.version_info < (3, 10))' || die "Python 3.10+ is required"
 
 # パイプ実行かクローン実行かを見分ける。パイプならソースを取りに行く。
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-/nonexistent}")" 2>/dev/null && pwd || true)"
@@ -93,7 +94,9 @@ fi
 if confirm "上限の手前で自動的にアカウントを切り替える常駐監視を入れますか?"; then
   if [ "$PLATFORM" = mac ]; then
     mkdir -p "$(dirname "$PLIST")"
-    sed -e "s|__HOME__|$HOME|g" -e "s|__MAG__|$SRC_DIR/mag.py|g" \
+    LOG_DIR="$(python3 -c 'import os, runpy, sys; m = runpy.run_path(sys.argv[1]); print(os.path.dirname(m["LOG_PATH"]))' "$SRC_DIR/mag.py")"
+    mkdir -p "$LOG_DIR"
+    sed -e "s|__LOG_DIR__|$LOG_DIR|g" -e "s|__PYTHON__|$(command -v python3)|g" -e "s|__MAG__|$SRC_DIR/mag.py|g" \
         "$SRC_DIR/launchd/com.magazine.watch.plist.template" > "$PLIST"
     launchctl bootout "gui/$(id -u)" "$PLIST" 2>/dev/null || true
     launchctl bootstrap "gui/$(id -u)" "$PLIST"

@@ -16,6 +16,8 @@ function Warn ($m) { Write-Host "  ! $m" -ForegroundColor Yellow }
 
 $py = (Get-Command python.exe -ErrorAction SilentlyContinue).Source
 if (-not $py) { throw "python が必要です (https://www.python.org/downloads/)" }
+& $py -c "import sys; sys.exit(sys.version_info < (3, 10))"
+if ($LASTEXITCODE -ne 0) { throw "Python 3.10+ is required" }
 
 # クローン内から実行されたか、パイプ実行かを見分ける
 $here = if ($PSScriptRoot) { Split-Path -Parent $PSScriptRoot } else { $null }
@@ -27,10 +29,12 @@ if ($here -and (Test-Path (Join-Path $here "mag.py"))) {
     if (-not (Get-Command git.exe -ErrorAction SilentlyContinue)) { throw "git が必要です" }
     if (Test-Path (Join-Path $SrcDir ".git")) {
         git -C $SrcDir pull --ff-only --quiet
+        if ($LASTEXITCODE -ne 0) { throw "Could not update the source; existing installation was left in place" }
         Ok "ソースを更新: $SrcDir"
     } else {
         New-Item -ItemType Directory -Force -Path (Split-Path -Parent $SrcDir) | Out-Null
         git clone --depth 1 --quiet $RepoUrl $SrcDir
+        if ($LASTEXITCODE -ne 0) { throw "Could not clone the source" }
         Ok "ソースを取得: $SrcDir"
     }
 }

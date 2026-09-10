@@ -7,7 +7,7 @@
 # 外すときは、読み込んでいる行を .bashrc / .zshrc から消すだけ。
 
 _magazine_py() {
-  command python3 "${MAGAZINE_SRC:-$HOME/.local/share/magazine}/mag.py" "$@"
+  command mag "$@"
 }
 
 claude() {
