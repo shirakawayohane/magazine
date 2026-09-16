@@ -1,6 +1,24 @@
 # Compatibility and verification
 
-Verification date: **2026-09-10**. Release: **v0.1.0** (early release).
+Verification date: **2026-09-16**. Release: **v0.1.1** (early release).
+
+## v0.1.1
+
+This release fixes three Codex credential and usage-attribution defects found on a real
+two-account setup on 2026-09-16 (macOS, Codex CLI **0.154.0**, default file credential store):
+
+- A credential that could not be verified because of a network error was installed anyway,
+  which put a revoked login into the live slot. Now the switch is refused instead.
+- Syncing the live credential back to its owner could overwrite a newer `mag login` result
+  with the revoked live copy, so signing in again never recovered. The newer copy now wins.
+- Usage written by a Codex process that started before a switch (including new threads in
+  an already-running Codex Desktop) was shown as the active account's usage, so two accounts
+  displayed identical numbers. Those records are now excluded.
+
+Observed on the real accounts after the fix: manual switch to the other account, a new
+`codex exec` request succeeding on the selected account, `mag login` for the revoked
+account, and `mag limits --refresh` reporting distinct usage for each account. The Python
+suite has 112 tests. Everything below was recorded for v0.1.0 and is otherwise unchanged.
 
 ## What was checked
 

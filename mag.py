@@ -40,7 +40,7 @@ import urllib.request
 import uuid
 from datetime import datetime, timedelta, timezone
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 
 HOME = os.path.expanduser("~")
 

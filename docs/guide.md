@@ -42,7 +42,7 @@ Restart an existing monitor after an update so it loads the new code.
 
 ## Codex setup
 
-magazine v0.1.0 uses the default user `.codex/auth.json` and `.codex/sessions` locations.
+magazine v0.1.1 uses the default user `.codex/auth.json` and `.codex/sessions` locations.
 It does not implement custom `CODEX_HOME`, keyring-only authentication, or API-key account rotation.
 
 OpenAI supports several [credential storage modes](https://learn.chatgpt.com/docs/auth#credential-storage).
