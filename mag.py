@@ -751,25 +751,30 @@ def codex_refresh(auth: dict) -> tuple[dict | None, str | None]:
     return new, None
 
 
-def codex_ensure_fresh(slug: str | None, auth: dict, verify: bool = False) -> tuple[dict, str | None]:
-    """(使える auth, 失効理由)。更新できたら保管庫へ書き戻す。
+def codex_ensure_fresh(slug: str | None, auth: dict, verify: bool = False) -> tuple[dict, str | None, bool]:
+    """(使える auth, 失効理由, サーバーで確かめられたか)。更新できたら保管庫へ書き戻す。
 
     verify=True では期限に関わらず必ず 1 回更新する。現用スロットを踏み潰す前に
     「この弾はまだ生きているか」を確かめるため。refresh token はローテーションする
     ので、保管したスナップショットは本体が 1 度更新しただけで死ぬ。死んだ弾を
     装填すると codex 側が auth.json を消してしまい、生きていたログインまで失う。
+
+    3 つ目は、この呼び出しでサーバーの返事を得られたか。圏外で確かめられなかった
+    ときは False で、手元の auth をそのまま返す。生死の分からない弾を装填しては
+    いけない（直前に失効と判定した弾を圏外の隙に装填してしまい、以後に始めた
+    codex セッションが全部止まった）。装填するかどうかは呼び出し側が決める。
     """
     exp = jwt_claims(((auth or {}).get("tokens") or {}).get("access_token") or "").get("exp")
     if not verify and exp and exp - now() > 300:
-        return auth, None
+        return auth, None, False
     new, dead = codex_refresh(auth)
     if dead:
-        return auth, dead
+        return auth, dead, True
     if not new:
-        return auth, None     # 通信できないだけ。手元のもので進む
+        return auth, None, False     # 通信できないだけ。生死は分からない
     if slug:
         codex_store_auth(slug, new)
-    return new, None
+    return new, None, True
 
 
 def codex_sync_live() -> str | None:
@@ -788,8 +793,15 @@ def codex_sync_live() -> str | None:
         if ((codex_stored_auth(a["slug"]) or {}).get("tokens") or {}).get("refresh_token") == rt:
             return a["slug"]          # 保管庫は既に最新
     email = (codex_identity(live).get("email") or "").lower()
+    live_at = parse_iso(live.get("last_refresh")) or 0
     for a in accs:
         if email and (a.get("email") or "").lower() == email:
+            stored = codex_stored_auth(a["slug"]) or {}
+            if (parse_iso(stored.get("last_refresh")) or 0) > live_at:
+                # 保管庫の方が新しい＝`mag login` で入れ直した直後。現用（古く、
+                # たいてい失効済み）で上書きすると、入れ直したログインをその場で失い、
+                # 何度ログインし直しても戻れなくなる（実際に起きた）。新しい方を残す。
+                return a["slug"]
             codex_store_auth(a["slug"], live)
             log(f"sync: {a['slug']} の保管トークンを現用の最新版に更新（rotation 追従）")
             return a["slug"]
@@ -845,7 +857,37 @@ def print_codex_switch_note(prov: str, name: str) -> None:
         print(note)
 
 
-def codex_live_limits(max_files: int = 20, only_after: float = None) -> dict | None:
+def _record_ts(line: str) -> float | None:
+    """セッション JSONL の 1 行から時刻を取る。壊れた行は None。"""
+    try:
+        return parse_iso(json.loads(line).get("timestamp"))
+    except (json.JSONDecodeError, AttributeError):
+        return None
+
+
+def codex_foreign_resets(slug: str) -> set:
+    """slug 以外の Codex アカウントで観測済みの枠リセット時刻（秒）。
+
+    枠のリセット時刻はアカウントごとに違うので、秒まで一致する記録は同じ
+    アカウントのもの。切替前から動いている codex プロセス（Codex Desktop や
+    開きっぱなしの TUI）は、切替後に新しいスレッドを作っても起動時の
+    アカウントで書き続ける。それを現用アカウントの数値として読まないための鍵。
+    自分の記録にもある時刻は除く（過去の誤帰属で他アカウントに残った自分の
+    時刻で、自分の記録まで捨てないように）。
+    """
+    own = {int(w["resets_at"]) for w in (known_limits(slug) or {}).get("windows") or [] if w.get("resets_at")}
+    out = set()
+    for a in accounts_of("codex"):
+        if a["slug"] == slug:
+            continue
+        for w in (known_limits(a["slug"]) or {}).get("windows") or []:
+            if w.get("resets_at") and int(w["resets_at"]) not in own:
+                out.add(int(w["resets_at"]))
+    return out
+
+
+def codex_live_limits(max_files: int = 20, only_after: float = None,
+                      exclude_resets: set = None) -> dict | None:
     """Codex の利用状況をセッション JSONL から拾う。
 
     Codex は残量 API を公開していない（Cloudflare 403）が、各ターンの応答に付いてくる
@@ -853,8 +895,13 @@ def codex_live_limits(max_files: int = 20, only_after: float = None) -> dict | N
 
     注意点:
       - limit_id が "codex" 以外（期間限定モデルの Spark 枠など）は別枠なので除外する
-      - 記録はその時ログインしていたアカウントのもの。装填を切り替えた後は
-        切替時刻より新しい記録だけを信用しないと、前のアカウントの数値を読んでしまう
+      - 記録は「そのセッションを始めたとき」にログインしていたアカウントのもの。
+        codex は起動時に読んだ認証を持ち続けるので、切替前に始まったセッションは
+        切替後も前のアカウントの残量を書き続ける（切替後 8 分経っても書いていた）。
+        切替時刻より後に始まったセッションの記録だけを信用する
+      - それでも、切替前から動いているプロセスが切替後に作った新しいスレッドは
+        見分けられない。exclude_resets（他アカウントで観測済みのリセット時刻）に
+        一致する記録は、そのアカウントの数値なので読まない
     """
     if not os.path.isdir(CODEX_SESSIONS_DIR):
         return None
@@ -874,7 +921,14 @@ def codex_live_limits(max_files: int = 20, only_after: float = None) -> dict | N
     for _mt, p in files[:max_files]:
         try:
             with open(p, errors="replace", encoding="utf-8") as f:
+                started = None
                 for line in f:
+                    if started is None:
+                        # 先頭行の時刻＝セッション開始。切替前に始まっていれば、
+                        # 以降の行がいつ書かれたものでも前のアカウントの数値
+                        started = _record_ts(line) or 0
+                        if only_after and started and started <= only_after:
+                            break
                     if '"rate_limits"' not in line:
                         continue
                     try:
@@ -891,6 +945,10 @@ def codex_live_limits(max_files: int = 20, only_after: float = None) -> dict | N
                         continue          # 装填切替より前の記録＝別アカウントの数値
                     if now() - ts > 7 * 24 * 3600:
                         continue
+                    if exclude_resets and any(
+                            int((rl.get(k) or {}).get("resets_at") or 0) in exclude_resets
+                            for k in ("primary", "secondary")):
+                        continue          # 他アカウントの枠＝古いプロセスが書いた別アカウントの数値
                     if best is None or ts > best["ts"]:
                         best = {"ts": ts, "rl": rl}
         except OSError:
@@ -918,8 +976,10 @@ def codex_live_limits(max_files: int = 20, only_after: float = None) -> dict | N
 
 
 def codex_worst(only_after: float = None) -> dict | None:
-    """Codex の最も逼迫している枠を返す。"""
-    lim = codex_live_limits(only_after=only_after)
+    """Codex の現用アカウントの、最も逼迫している枠を返す。"""
+    cur = get_current("codex")
+    lim = codex_live_limits(only_after=only_after,
+                            exclude_resets=codex_foreign_resets(cur) if cur else None)
     if not lim or not lim["windows"]:
         return None
     w = max(lim["windows"], key=lambda x: x["pct"])
@@ -939,7 +999,7 @@ def codex_probe(slug: str, timeout: int = 90) -> dict | None:
     auth = codex_stored_auth(slug)
     if not auth:
         return None
-    auth, dead = codex_ensure_fresh(slug, auth)
+    auth, dead, _checked = codex_ensure_fresh(slug, auth)
     if dead:
         return {"dead": True, "error": dead}
     import tempfile, shutil as _sh
@@ -1315,13 +1375,24 @@ def do_load(slug: str, reason: str = "") -> bool:
         outgoing = codex_sync_live()
         # 装填してから死んでいると分かっても遅い（codex 本体が auth.json を
         # 消してしまい、直前まで使えていたログインごと失う）。先に確かめる。
-        auth, dead = codex_ensure_fresh(slug, auth, verify=True)
+        auth, dead, checked = codex_ensure_fresh(slug, auth, verify=True)
         if dead:
             print(T(f"✗ {name}: {dead} — run `mag login codex {name}` to sign in again "
                     f"(the active account is left as it is)",
                     f"✗ {name}: {dead} — `mag login codex {name}` で入れ直してください"
                     f"（今使っているアカウントはそのままです）"), file=sys.stderr)
             log(f"load refused: {slug}: {dead}")
+            return False
+        if not checked:
+            # 圏外で生死を確かめられなかった。死んでいた場合、装填した瞬間から
+            # 新しく始める codex セッションが全部止まる。codex 自体も圏外では
+            # 使えないので、待つ方が安い。
+            print(T(f"✗ {name}: could not confirm the credential is still valid (network error) — "
+                    f"not switching; try again once online (the active account is left as it is)",
+                    f"✗ {name}: 認証情報が生きているか確認できません（ネットワークエラー）— "
+                    f"切り替えません。接続を確認して再実行してください（今使っているアカウントはそのままです）"),
+                  file=sys.stderr)
+            log(f"load deferred: {slug}: could not verify (network)")
             return False
         try:
             # 認証情報と state の持ち主が一致する場合だけ、切替前の記録を保存する。
@@ -1826,7 +1897,7 @@ def codex_usage_snapshot(slug: str, refresh: bool = False) -> dict:
     lim = None
     if get_current("codex") == slug:
         since = (state().get("last_switch_by") or {}).get("codex")
-        lim = codex_live_limits(only_after=since)
+        lim = codex_live_limits(only_after=since, exclude_resets=codex_foreign_resets(slug))
         if not lim:
             row["note"] = T("no usage recorded yet (run codex once)",
                             "残量の記録なし（codex で1回やり取りすると出ます）")

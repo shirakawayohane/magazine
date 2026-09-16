@@ -140,7 +140,7 @@ class CodexUsageCache(Base):
 
     def test_switch_saves_outgoing_usage_before_credentials_change(self):
         self.patch("codex_sync_live", lambda: "cx1")
-        self.patch("codex_ensure_fresh", lambda slug, auth, **kwargs: (auth, None) if kwargs.get("verify") else auth)
+        self.patch("codex_ensure_fresh", lambda slug, auth, **kwargs: (auth, None, True))
         self.patch("codex_live_limits", lambda **kwargs: self.snapshot)
 
         def install(auth):
@@ -153,7 +153,7 @@ class CodexUsageCache(Base):
 
     def test_unmatched_outgoing_account_is_not_assigned_session_usage(self):
         self.patch("codex_sync_live", lambda: "cx2")
-        self.patch("codex_ensure_fresh", lambda slug, auth, **kwargs: (auth, None) if kwargs.get("verify") else auth)
+        self.patch("codex_ensure_fresh", lambda slug, auth, **kwargs: (auth, None, True))
         self.patch("codex_live_limits", self._no_network)
         self.patch("codex_install_auth", lambda auth: None)
         self.assertTrue(mag.do_load("cx2"))

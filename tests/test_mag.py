@@ -260,16 +260,19 @@ class CodexUsage(Base):
         """相対時刻の ISO 文字列。固定日付にすると 7 日で腐る。"""
         return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - minutes * 60))
 
+    @staticmethod
+    def record(ts, pct, limit_id="codex", window=10080):
+        return {"timestamp": ts, "type": "event_msg",
+                "payload": {"type": "token_count",
+                            "rate_limits": {"limit_id": limit_id, "plan_type": "pro",
+                                            "primary": {"used_percent": pct,
+                                                        "window_minutes": window,
+                                                        "resets_at": time.time() + 600},
+                                            "secondary": None}}}
+
     def write_record(self, name, ts, pct, limit_id="codex", window=10080):
-        rec = {"timestamp": ts, "type": "event_msg",
-               "payload": {"type": "token_count",
-                           "rate_limits": {"limit_id": limit_id, "plan_type": "pro",
-                                           "primary": {"used_percent": pct,
-                                                       "window_minutes": window,
-                                                       "resets_at": time.time() + 600},
-                                           "secondary": None}}}
         with open(os.path.join(self.sessions, name), "w") as f:
-            f.write(json.dumps(rec) + "\n")
+            f.write(json.dumps(self.record(ts, pct, limit_id, window)) + "\n")
 
     def test_reads_the_latest_usage(self):
         self.write_record("s1.jsonl", self.ago(120), 40.0)
@@ -290,6 +293,41 @@ class CodexUsage(Base):
         cutoff = mag.parse_iso(self.ago(60))
         self.assertIsNone(mag.codex_live_limits(only_after=cutoff),
                           "切り替え前の記録は別アカウントの数値")
+
+    def test_a_session_started_before_the_swap_stays_excluded_while_it_keeps_writing(self):
+        # codex は起動時に読んだ認証を持ち続ける。切替前に始まったセッションは切替後も
+        # 前のアカウントの残量を書くので、記録の時刻で切るだけでは混ざる（実際に
+        # 切替後の記録を新しいアカウントの数値として表示し、2 つが同じ値になった）。
+        cutoff = mag.parse_iso(self.ago(60))
+        self.write_record("old-session.jsonl", self.ago(120), 95.0)
+        with open(os.path.join(self.sessions, "old-session.jsonl"), "a") as f:
+            f.write(json.dumps(self.record(self.ago(30), 95.0)) + "\n")
+        self.assertIsNone(mag.codex_live_limits(only_after=cutoff),
+                          "切替前に始まったセッションの記録は、切替後の行でも別アカウント")
+        self.write_record("new-session.jsonl", self.ago(20), 14.0)
+        self.assertEqual(mag.codex_live_limits(only_after=cutoff)["windows"][0]["pct"], 14.0,
+                         "切替後に始まったセッションの記録は読む")
+
+    def test_a_window_seen_on_another_account_is_not_read_as_ours(self):
+        # 枠のリセット時刻はアカウント固有。切替前から動いている Codex Desktop が
+        # 切替後に新しいスレッドを作ると「切替後に始まったセッション」に見えるが、
+        # 中身は前のアカウントの残量（実際に 2 アカウントが同じ 14% になった）。
+        self.write_record("desktop.jsonl", self.ago(10), 14.0)
+        foreign = int(self.record(self.ago(10), 14.0)["payload"]["rate_limits"]["primary"]["resets_at"])
+        lim = mag.codex_live_limits()
+        self.assertIsNone(mag.codex_live_limits(exclude_resets={int(lim["windows"][0]["resets_at"])}),
+                          "他アカウントで観測済みのリセット時刻を持つ記録は読まない")
+        self.assertEqual(mag.codex_live_limits(exclude_resets={foreign + 12345})["windows"][0]["pct"], 14.0)
+
+    def test_foreign_resets_come_from_other_accounts_records_only(self):
+        self.add_account("cx1", provider="codex")
+        self.add_account("cx2", provider="codex")
+        mag.record_limits("cx1", {"windows": [{"label": "7d window", "pct": 14.0, "resets_at": 1789884074}], "ts": 1.0})
+        mag.record_limits("cx2", {"windows": [{"label": "7d window", "pct": 40.0, "resets_at": 1789832498}], "ts": 1.0})
+        self.assertEqual(mag.codex_foreign_resets("cx2"), {1789884074})
+        # 過去の誤帰属で自分の時刻が他アカウントにも残っている場合、自分の記録は捨てない
+        mag.record_limits("cx2", {"windows": [{"label": "7d window", "pct": 14.0, "resets_at": 1789884074}], "ts": 2.0})
+        self.assertEqual(mag.codex_foreign_resets("cx2"), set())
 
     def test_window_is_labelled_by_its_length(self):
         self.write_record("w.jsonl", self.ago(60), 5.0, window=300)   # 5時間
@@ -381,7 +419,7 @@ class CodexTokenRotation(Base):
         self.add_account("cx2", provider="codex", email="two@example.com")
 
     @staticmethod
-    def auth(email, refresh_token, exp_in=3600):
+    def auth(email, refresh_token, exp_in=3600, last_refresh="2026-01-01T00:00:00Z"):
         import base64
 
         def jwt(claims):
@@ -391,7 +429,7 @@ class CodexTokenRotation(Base):
         return {"tokens": {"access_token": jwt({"exp": time.time() + exp_in}),
                            "id_token": jwt({"email": email}),
                            "refresh_token": refresh_token},
-                "last_refresh": "2026-01-01T00:00:00Z"}
+                "last_refresh": last_refresh}
 
     def put_live(self, auth):
         with open(mag.CODEX_AUTH_PATH, "w") as f:
@@ -430,11 +468,38 @@ class CodexTokenRotation(Base):
         self.assertEqual(mag.codex_stored_auth("cx2")["tokens"]["refresh_token"], "rt-two-next")
         self.assertEqual(mag.codex_live_auth()["tokens"]["refresh_token"], "rt-two-next")
 
-    def test_being_offline_does_not_block_the_switch(self):
+    def test_an_unverifiable_credential_is_not_installed(self):
+        # 直前に「失効」と判定された弾を、圏外の隙に「確かめられないので手元のもので
+        # 進む」で装填してしまい、以後に始めた codex セッションが全部止まった（実際に
+        # 起きた）。生死が分からないなら装填しない。codex 自体も圏外では使えない。
+        mag.codex_store_auth("cx1", self.auth("one@example.com", "rt-one"))
         mag.codex_store_auth("cx2", self.auth("two@example.com", "rt-two"))
+        self.put_live(self.auth("one@example.com", "rt-one"))
         self.patch("codex_refresh", lambda a: (None, None))
-        self.assertTrue(mag.do_load("cx2"), "圏外なら手元のトークンで進む")
-        self.assertEqual(mag.codex_live_auth()["tokens"]["refresh_token"], "rt-two")
+        self.assertFalse(mag.do_load("cx2"), "生きているか分からない弾は装填しない")
+        self.assertEqual(mag.codex_live_auth()["tokens"]["refresh_token"], "rt-one",
+                         "使えていたログインはそのまま残る")
+        self.assertNotEqual(mag.get_current("codex"), "cx2")
+
+    def test_sync_keeps_a_fresher_login_in_the_store(self):
+        # `mag login` で入れ直した 10 秒後に、現用の古い（失効した）認証で保管庫を
+        # 上書きしてしまい、何度ログインし直しても戻れなかった（実際に起きた）。
+        mag.codex_store_auth("cx1", self.auth("one@example.com", "rt-fresh-login",
+                                              last_refresh="2026-09-16T04:02:07Z"))
+        self.put_live(self.auth("one@example.com", "rt-old-dead",
+                                last_refresh="2026-09-14T07:41:04.101Z"))
+        self.assertEqual(mag.codex_sync_live(), "cx1", "持ち主の判定は変わらない")
+        self.assertEqual(mag.codex_stored_auth("cx1")["tokens"]["refresh_token"], "rt-fresh-login",
+                         "新しいログインを古い現用で上書きしない")
+
+    def test_sync_follows_the_live_rotation_when_live_is_newer(self):
+        mag.codex_store_auth("cx1", self.auth("one@example.com", "rt-stale",
+                                              last_refresh="2026-09-14T07:41:04Z"))
+        self.put_live(self.auth("one@example.com", "rt-rotated",
+                                last_refresh="2026-09-16T04:02:07Z"))
+        self.assertEqual(mag.codex_sync_live(), "cx1")
+        self.assertEqual(mag.codex_stored_auth("cx1")["tokens"]["refresh_token"], "rt-rotated",
+                         "本体が更新した現用の方が新しければ保管庫を追従させる")
 
     def test_an_invalidated_refresh_token_is_reported_as_dead(self):
         import io
