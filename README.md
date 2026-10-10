@@ -30,7 +30,7 @@ resume preview, not a live AI session. [Text version and reproduction](docs/demo
 | | Claude Code | Codex / ChatGPT |
 | --- | --- | --- |
 | Account registration and switching | Yes | Yes; subscription login with file storage |
-| Usage | Provider usage endpoint and status-line data | Local session records; optional refresh request |
+| Usage | Provider usage endpoint and status-line data | Codex account limits API and local session records |
 | Switching a running session | Can be picked up by Claude Code; timing depends on its credential cache/version | Start Codex again to use the selected account |
 | Interrupted-session discovery and resume | Yes, for recognized local session records | Not implemented |
 
@@ -43,10 +43,10 @@ See [compatibility and verification](docs/verification.md) for what has actually
 Requires **Python 3.10+**, Git, and Claude Code and/or Codex.
 On macOS/Linux, the Python command must be `python3`; on Windows, `python.exe`.
 
-Clone the first release so you can inspect the installer before running it:
+Clone the tagged release so you can inspect the installer before running it:
 
 ```sh
-git clone --branch v0.1.1 --depth 1 https://github.com/shirakawayohane/magazine.git
+git clone --branch v0.1.2 --depth 1 https://github.com/shirakawayohane/magazine.git
 cd magazine
 ```
 
@@ -115,7 +115,8 @@ mag watch
 ```
 
 Keep this terminal open, or enable background monitoring through the installer.
-The default switching threshold is **97%**. Detection depends on available usage data;
+The default switching threshold is **97%**. An explicit `mag use <name>` keeps that
+account selected until **100%** usage. Detection depends on available usage data;
 it is not a spending cap. The monitor can make a small Claude request to pre-check a
 spare account. [Network access and usage costs](docs/guide.md#usage-data-and-network-access).
 

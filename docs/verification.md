@@ -1,6 +1,37 @@
 # Compatibility and verification
 
-Verification date: **2026-09-16**. Release: **v0.1.1** (early release).
+Verification date: **2026-10-10**. Release: **v0.1.2** (early release).
+
+## v0.1.2
+
+Manual account selections now wait for 100% usage before automatic switching.
+Selecting an account clears its earlier cooldown, including when it is already active.
+Claude status-line reports must be confirmed by that account's own usage measurement
+before they can override the selection. Codex usage lookup now uses the installed
+CLI's account limits API without an inference request or refresh-token rotation.
+
+- All 134 regression tests passed locally on macOS with Python 3.14.5. The 11 manual
+  selection tests also passed under the existing monitor's Python 3.9.6; the documented
+  installation requirement remains Python 3.10+.
+- Regression cases cover both accounts at 98%, the 99.9%/100% boundary in both usage
+  windows, stale or unavailable usage, reselecting the current account, monitor restarts,
+  independent Claude/Codex selections, and returning to normal automatic rotation.
+- Codex limits tests substitute the app-server process and cover account-wide versus
+  model-specific limits, zero usage, timeout/exit failures, authentication renewal,
+  matching credentials, and reuse of fresh or previously observed usage.
+- The offline CLI walkthrough, Python syntax check, and Bash syntax checks passed.
+- On a real macOS installation, selecting a Claude account cleared its old cooldown.
+  Both pre-launch checks retained it; the usage check reported 13% five-hour usage.
+  After restarting the monitor, a subsequent heartbeat retained the manual selection
+  with a 100% threshold and no cooldown. No inference request was needed for this check.
+
+The 100% boundary is verified with synthetic usage, not by consuming a real account's
+remaining quota. Live Codex login/inference and adoption by already-running provider
+sessions were not revalidated for this release. See the exact release commit in
+[GitHub Actions](https://github.com/shirakawayohane/magazine/actions/workflows/test.yml)
+for the macOS, Ubuntu, and Windows checks with Python 3.10 and 3.13.
+
+Earlier release evidence follows.
 
 ## v0.1.1
 

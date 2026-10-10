@@ -75,7 +75,7 @@ def capture():
             with contextlib.redirect_stdout(io.StringIO()):
                 assert mag.cmd_add(argparse.Namespace(provider="codex", alias="codex-main")) == 0
             # Feed a synthetic journal result at the provider boundary.
-            mag.codex_live_limits = lambda **kwargs: {"windows": [{"label": "weekly", "pct": 42.0, "window_minutes": 10080, "resets_at": mag.now() + 7200}]}
+            mag.codex_live_limits = lambda **kwargs: {"ts": mag.now(), "windows": [{"label": "weekly", "pct": 42.0, "window_minutes": 10080, "resets_at": mag.now() + 7200}]}
             command("01 / See every account", ["limits"], 9, "Synthetic accounts. Real command output. No network.")
             command("02 / Switch by name", ["use", "spare"], 6, "Claude Code can pick up changed credentials; timing depends on its version.")
             assert mag.current_oauth()["accessToken"] == "sk-ant-demo-spare"

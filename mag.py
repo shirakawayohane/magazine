@@ -29,10 +29,12 @@ import contextlib
 import hashlib
 import json
 import os
+import queue
 import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import unicodedata
 import urllib.error
@@ -40,7 +42,7 @@ import urllib.request
 import uuid
 from datetime import datetime, timedelta, timezone
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 
 HOME = os.path.expanduser("~")
 
@@ -890,8 +892,8 @@ def codex_live_limits(max_files: int = 20, only_after: float = None,
                       exclude_resets: set = None) -> dict | None:
     """Codex の利用状況をセッション JSONL から拾う。
 
-    Codex は残量 API を公開していない（Cloudflare 403）が、各ターンの応答に付いてくる
-    rate_limits を ~/.codex/sessions/**/*.jsonl に書き出している。ai-limits(1) と同じ源。
+    各ターンの rate_limits を ~/.codex/sessions/**/*.jsonl から読む。
+    表示用の古い記録は別途 app-server で更新する。ここはローカル記録だけを扱う。
 
     注意点:
       - limit_id が "codex" 以外（期間限定モデルの Spark 枠など）は別枠なので除外する
@@ -986,82 +988,119 @@ def codex_worst(only_after: float = None) -> dict | None:
     return {**w, "plan": lim.get("plan"), "reached": lim.get("reached"), "ts": lim["ts"]}
 
 
-def codex_probe(slug: str, timeout: int = 90) -> dict | None:
-    """装填していない Codex アカウントの残量を取る。
+def codex_rate_limits(auth: dict, timeout: float = 15) -> dict:
+    """Read account limits without inference or rotating shared credentials."""
+    import tempfile
+    tok = auth.get("tokens") or {}
+    ident = codex_identity(auth)
+    account_id = tok.get("account_id") or ident.get("account_id")
+    if not tok.get("access_token") or not account_id:
+        return {"error": T("no usable Codex sign-in; log in again",
+                           "Codex の認証情報がありません。再ログインしてください")}
 
-    Codex は残量 API を公開していないが、CODEX_HOME を向ければ設定ごと別の
-    アカウントとして動く。使い捨ての一時ディレクトリにその弾の auth.json を置き、
-    最小のリクエストを1回投げて、そこに記録された rate_limits を読む。
-    現用の ~/.codex/auth.json には一切触らないので、走っているセッションに影響しない。
+    # External-token login keeps the running Codex session's refresh token intact.
+    # The temporary home has neither user config/MCP servers nor stored credentials.
+    with tempfile.TemporaryDirectory(prefix="mag-codex-limits-") as home:
+        proc = None
+        reader = None
+        try:
+            proc = subprocess.Popen(
+                [find_codex_bin(), "app-server"],
+                env={**os.environ, "CODEX_HOME": home}, cwd=home,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, text=True, encoding="utf-8")
+            messages = queue.Queue()
+            deadline = time.monotonic() + timeout
 
-    ただしリクエストを1回消費するので、常時ポーリングには使わないこと。
-    """
-    auth = codex_stored_auth(slug)
-    if not auth:
-        return None
-    auth, dead, _checked = codex_ensure_fresh(slug, auth)
-    if dead:
-        return {"dead": True, "error": dead}
-    import tempfile, shutil as _sh
-    home = tempfile.mkdtemp(prefix="mag-codex-")
-    try:
-        with open(os.path.join(home, "auth.json"), "w", encoding="utf-8") as f:
-            json.dump(auth, f)
-        os.chmod(os.path.join(home, "auth.json"), 0o600)
-        src_cfg = os.path.expanduser("~/.codex/config.toml")
-        if os.path.exists(src_cfg):
-            try:
-                _sh.copy(src_cfg, os.path.join(home, "config.toml"))
-            except OSError:
-                pass
-        env = dict(os.environ)
-        env["CODEX_HOME"] = home
-        r = subprocess.run(
-            [find_codex_bin(), "exec", "--skip-git-repo-check", "OK"],
-            env=env, capture_output=True, text=True, timeout=timeout, cwd="/tmp")
-        out = (r.stdout or "") + (r.stderr or "")
-        if re.search(r"refresh token was revoked|could not be refreshed", out, re.I):
-            return {"dead": True}
-
-        best = None
-        for root, _d, names in os.walk(home):
-            for n in names:
-                if not n.endswith(".jsonl"):
-                    continue
+            def read_messages():
                 try:
-                    with open(os.path.join(root, n), errors="replace", encoding="utf-8") as f:
-                        for line in f:
-                            if '"rate_limits"' not in line:
-                                continue
-                            d = json.loads(line)
-                            rl = ((d.get("payload") or {}).get("rate_limits")) or {}
-                            if (rl.get("limit_id") or "codex") != "codex":
-                                continue
-                            if (rl.get("primary") or {}).get("used_percent") is None:
-                                continue
-                            ts = parse_iso(d.get("timestamp")) or 0
-                            if best is None or ts > best[0]:
-                                best = (ts, rl)
-                except (OSError, json.JSONDecodeError):
+                    for line in proc.stdout:
+                        try:
+                            messages.put(json.loads(line))
+                        except ValueError:
+                            continue
+                finally:
+                    messages.put(None)
+
+            reader = threading.Thread(target=read_messages, daemon=True)
+            reader.start()
+
+            def rpc(request_id, method, params):
+                proc.stdin.write(json.dumps({"id": request_id, "method": method,
+                                             "params": params}) + "\n")
+                proc.stdin.flush()
+                while True:
+                    msg = messages.get(timeout=max(0.001, deadline - time.monotonic()))
+                    if msg is None:
+                        raise OSError("app-server exited")
+                    if not isinstance(msg, dict):
+                        continue
+                    if msg.get("method") == "account/chatgptAuthTokens/refresh":
+                        # Never refresh a token behind the running client's back.
+                        raise PermissionError()
+                    if msg.get("id") == request_id and "method" not in msg:
+                        if "error" in msg:
+                            raise OSError("app-server request failed")
+                        return msg.get("result") or {}
+                    if time.monotonic() >= deadline:
+                        raise queue.Empty()
+
+            rpc(1, "initialize", {"clientInfo": {"name": "magazine", "version": VERSION},
+                                  "capabilities": {"experimentalApi": True}})
+            rpc(2, "account/login/start", {
+                "type": "chatgptAuthTokens", "accessToken": tok["access_token"],
+                "chatgptAccountId": account_id, "chatgptPlanType": ident.get("plan")})
+            result = rpc(3, "account/rateLimits/read", {})
+            buckets = result.get("rateLimitsByLimitId")
+            rl = (buckets.get("codex") or {}) if buckets is not None else result.get("rateLimits") or {}
+            if rl.get("limitId") not in (None, "codex"):
+                rl = {}
+            wins = []
+            for key in ("primary", "secondary"):
+                window = rl.get(key) or {}
+                pct = window.get("usedPercent")
+                if pct is None:
                     continue
-        if not best:
-            return None
-        rl = best[1]
-        wins = []
-        for k in ("primary", "secondary"):
-            b = rl.get(k)
-            if not b or b.get("used_percent") is None:
-                continue
-            wm = b.get("window_minutes") or 0
-            wins.append({"label": (f"{wm // 60}h window" if wm < 10080 else f"{wm // 1440}d window")
-                         if LANG == "en" else (f"{wm // 60}時間枠" if wm < 10080 else f"{wm // 1440}日枠"),
-                         "pct": b["used_percent"], "resets_at": b.get("resets_at")})
-        return {"windows": wins, "plan": rl.get("plan_type"),
-                "reached": rl.get("rate_limit_reached_type"), "ts": best[0]}
-    except subprocess.TimeoutExpired:
-        return None
-    finally:
-        _sh.rmtree(home, ignore_errors=True)
+                wm = window.get("windowDurationMins") or 0
+                wins.append({"key": key, "pct": pct, "window_minutes": wm,
+                             "resets_at": window.get("resetsAt"),
+                             "label": (f"{wm // 60}h window" if wm < 10080 else f"{wm // 1440}d window")
+                             if LANG == "en" else (f"{wm // 60}時間枠" if wm < 10080 else f"{wm // 1440}日枠")})
+            if not wins:
+                raise ValueError("no account-wide usage")
+            return {"windows": wins, "ts": now(), "plan": rl.get("planType"),
+                    "reached": rl.get("rateLimitReachedType")}
+        except PermissionError:
+            return {"error": T("Codex sign-in needs renewal; log in again",
+                               "Codex の認証を更新できません。再ログインしてください")}
+        except (OSError, ValueError, TypeError, AttributeError, queue.Empty):
+            return {"error": T("could not read current usage; retry with mag limits --refresh",
+                               "現在の残量を取得できませんでした。mag limits --refresh で再試行できます")}
+        finally:
+            if proc is not None:
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait()
+                if reader is not None:
+                    reader.join(timeout=2)
+                proc.stdin.close()
+                proc.stdout.close()
+
+
+def codex_probe(slug: str, timeout: int = 15) -> dict | None:
+    """Read this account's limits without spending an inference request."""
+    auth = codex_stored_auth(slug) or {}
+    live = codex_live_auth() or {}
+    stored_id = (auth.get("tokens") or {}).get("account_id") or codex_identity(auth).get("account_id")
+    live_id = (live.get("tokens") or {}).get("account_id") or codex_identity(live).get("account_id")
+    if stored_id and stored_id == live_id:
+        if (parse_iso(live.get("last_refresh")) or 0) > (parse_iso(auth.get("last_refresh")) or 0):
+            auth = live
+    return codex_rate_limits(auth, timeout=timeout)
 
 
 def find_codex_bin() -> str:
@@ -1118,16 +1157,35 @@ def get_current(provider: str) -> str | None:
     return cur if provider == "claude" else None
 
 
-def set_current(provider: str, slug: str) -> None:
+def set_current(provider: str, slug: str, *, manual: bool = False) -> None:
     s = state()
     cur = s.get("current")
     if not isinstance(cur, dict):
         cur = {"claude": cur} if cur else {}
+    # Reaffirming the same selection must not discard its active session readings.
+    if not manual or cur.get(provider) != slug:
+        s.setdefault("last_switch_by", {})[provider] = now()
+        s["last_switch"] = now()
     cur[provider] = slug
     s["current"] = cur
-    s.setdefault("last_switch_by", {})[provider] = now()
-    s["last_switch"] = now()
+    selected = s.setdefault("manual_selection", {})
+    if manual:
+        selected[provider] = slug
+        # A deliberate retry supersedes an earlier (possibly preventive) cooldown.
+        s.setdefault("cooldowns", {}).pop(slug, None)
+    else:
+        selected.pop(provider, None)
     save_state(s)
+
+
+def manually_selected(slug: str | None, provider: str = "claude") -> bool:
+    return bool(slug and get_current(provider) == slug
+                and (state().get("manual_selection") or {}).get(provider) == slug)
+
+
+def usage_threshold(slug: str | None, default: float, provider: str = "claude") -> float:
+    """An explicit `mag use` keeps the selected account until it is fully used."""
+    return 100.0 if manually_selected(slug, provider) else default
 
 
 def find_account(slug: str) -> dict | None:
@@ -1356,6 +1414,7 @@ def is_usable(slug: str, p: dict = None) -> tuple[bool, str]:
     # 閾値超えは「予防的にスキップ」であって上限確定ではないので cooldown は張らない。
     # cooldown は実ヒット（出力の上限メッセージ検知）でのみ張る。
     for kind, th in (("five_hour", cfg["five_hour_threshold"]), ("seven_day", cfg["seven_day_threshold"])):
+        th = usage_threshold(slug, th)
         pct = (p[kind] or {}).get("pct")
         if pct is not None and pct >= th:
             return False, T(f"{kind} {pct:.1f}% ≥ threshold {th:.1f}%", f"{kind} {pct:.1f}% ≥ 閾値{th:.1f}%")
@@ -1419,7 +1478,7 @@ def do_load(slug: str, reason: str = "") -> bool:
             log(f"load failed: {slug}: {e}")
             return False
 
-    set_current(prov, slug)
+    set_current(prov, slug, manual=(reason == "manual"))
     log(f"load[{prov}]: {slug} ({acct.get('email','?')}) {reason}")
     return True
 
@@ -1888,46 +1947,45 @@ def known_limits(slug: str) -> dict | None:
 
 
 def codex_usage_snapshot(slug: str, refresh: bool = False) -> dict:
-    """表示用の観測値。取得できない場合も、同じアカウントの前回値を残す。
-
-    自動切替の可否判定には使わない。通常表示では追加のリクエストを送らない。
-    """
+    """Display-only snapshot; refresh active accounts when their observation is old."""
     row = {"windows": [], "note": None}
     old = known_limits(slug)
     lim = None
-    if get_current("codex") == slug:
+    is_current = get_current("codex") == slug
+    if is_current and not refresh:
         since = (state().get("last_switch_by") or {}).get("codex")
         lim = codex_live_limits(only_after=since, exclude_resets=codex_foreign_resets(slug))
-        if not lim:
-            row["note"] = T("no usage recorded yet (run codex once)",
-                            "残量の記録なし（codex で1回やり取りすると出ます）")
-    elif refresh:
+    candidates = [v for v in (old, lim) if v and v.get("windows")]
+    latest = max(candidates, key=lambda v: v.get("ts") or 0) if candidates else None
+    fresh = bool(latest and now() - (latest.get("ts") or 0) < 60
+                 and not any(w.get("resets_at") and w["resets_at"] <= now()
+                             for w in latest["windows"]))
+    attempted = refresh or (is_current and not fresh)
+    if attempted:
         lim = codex_probe(slug)
         if lim and lim.get("dead"):
             row["note"] = T("needs re-login (refresh token revoked)", "要再ログイン（refresh token 失効）")
-        elif not lim:
-            row["note"] = T("could not read usage", "残量を取得できませんでした")
+        elif not lim or not lim.get("windows"):
+            row["note"] = (lim or {}).get("error") or T("could not read usage", "残量を取得できませんでした")
+    elif is_current and fresh:
+        lim = latest
 
-    # 明示更新で保存した値より古いセッション記録に、前回値を巻き戻さない。
-    if (lim and lim.get("ts") and old and old.get("windows")
-            and (old.get("ts") or 0) > lim["ts"]):
-        lim = None
+    if lim and lim.get("windows") and latest and (latest.get("ts") or 0) > (lim.get("ts") or 0):
+        lim = latest
     if lim and not lim.get("dead") and lim.get("windows"):
         row["windows"] = [{"label": w["label"], "pct": w["pct"],
                            "resets_at": w.get("resets_at")} for w in lim["windows"]]
         row["reached"] = lim.get("reached")
         row["observed_ts"] = lim.get("ts") or now()
         record_limits(slug, {"windows": row["windows"], "ts": row["observed_ts"]})
-    else:
-        if old and old.get("windows"):
-            row["windows"] = old["windows"]
-            row["stale_ts"] = old.get("ts")
-            # 未観測という案内は前回値がある場合には不要。更新失敗の理由は残す。
-            if not refresh or get_current("codex") == slug:
-                row["note"] = None
-        elif not row["note"]:
-            row["note"] = T("never observed (use mag limits --refresh to measure)",
-                            "未観測（mag limits --refresh で実測できます）")
+    elif latest:
+        row["windows"] = latest["windows"]
+        row["stale_ts"] = latest.get("ts")
+        if latest is not old:
+            record_limits(slug, latest)
+    elif not row["note"]:
+        row["note"] = T("never observed (use mag limits --refresh to measure)",
+                        "未観測（mag limits --refresh で実測できます）")
     return row
 
 
@@ -2106,11 +2164,16 @@ def cmd_load(args) -> int:
         return 1
     prov = provider_of(acct)
     if get_current(prov) == acct["slug"]:
+        set_current(prov, acct["slug"], manual=True)
         print(T(f"= already active: {describe(acct)}", f"= すでに使用中: {describe(acct)}"))
+        print(T("  Manual selection: automatic switching waits for 100% usage.",
+                "  手動選択を優先: 使用率100%になるまで自動切替しません。"))
         return 0
     if not do_load(acct["slug"], "manual"):
         return 1
     print(T(f"🔁 switched to: {describe(acct)}", f"🔁 切り替え: {describe(acct)}"))
+    print(T("  Manual selection: automatic switching waits for 100% usage.",
+            "  手動選択を優先: 使用率100%になるまで自動切替しません。"))
     print_codex_switch_note(prov, display(acct))
     return 0
 
@@ -2532,6 +2595,13 @@ def set_cooldown_verified(slug: str, kind: str, resets_at=None, source: str = ""
     cooldown を張ると、まだ余裕のあるアカウントを外してしまう。
     """
     p = probe(slug)
+    if manually_selected(slug):
+        pct = (p.get(kind) or {}).get("pct")
+        # Old sessions may still report a different account's limits. For an
+        # explicit choice, require this account's own measurement of 100%.
+        if not p.get("ok") or pct is None or pct < 100.0:
+            log(f"cooldown 見送り: {slug} は手動選択中、実測100%を未確認（{source}）")
+            return False
     if p.get("ok"):
         blk = p.get(kind) or {}
         pct = blk.get("pct")
@@ -2692,7 +2762,7 @@ def cmd_watch(args) -> int:
 
             # 1) statusLine 経由のリアルタイム値（稼働中セッションがある間は最速）
             lv = live_worst()
-            if lv and lv["pct"] >= th and has_spare(cur):
+            if lv and lv["pct"] >= usage_threshold(cur, th) and has_spare(cur):
                 label = {"five_hour": "5h", "seven_day": "7d"}[lv["kind"]]
                 swapped = hotswap(lv["kind"], f"{label} {lv['pct']:.0f}%", lv.get("resets_at"))
 
@@ -2721,7 +2791,8 @@ def cmd_watch(args) -> int:
             if cur_cx and accounts_of("codex"):
                 since = (state().get("last_switch_by") or {}).get("codex")
                 cw = codex_worst(only_after=since)
-                if cw and (cw["pct"] >= th or cw.get("reached")):
+                if cw and (cw["pct"] >= usage_threshold(cur_cx, th, "codex")
+                           or (cw.get("reached") and not manually_selected(cur_cx, "codex"))):
                     if has_spare(cur_cx, "codex"):
                         set_cooldown(cur_cx,
                                      "seven_day" if cw["window_minutes"] >= 10080 else "five_hour",
@@ -2747,7 +2818,7 @@ def cmd_watch(args) -> int:
                     else:
                         for k in ("five_hour", "seven_day"):
                             pct = (p.get(k) or {}).get("pct")
-                            if pct is not None and pct >= th and has_spare(cur):
+                            if pct is not None and pct >= usage_threshold(cur, th) and has_spare(cur):
                                 label = {"five_hour": "5h", "seven_day": "7d"}[k]
                                 hotswap(k, f"{label} {pct:.0f}%", (p.get(k) or {}).get("resets_at"))
                                 break
@@ -3076,8 +3147,8 @@ Registering (the alias is what you type from then on):
     a = sub.add_parser("limits", aliases=["l"], help=T("show usage for every account at once","全アカウントの残量を一覧"))
     a.add_argument("--json", action="store_true", help=T("output JSON (for scripts)","JSON で出力（スクリプト用）"))
     a.add_argument("--refresh", action="store_true",
-                   help=T("measure inactive Codex accounts too (costs one request each)",
-                          "装填していない Codex も実測する（1アカウントにつき1リクエスト消費）"))
+                   help=T("fetch current usage for all Codex accounts (no inference request)",
+                          "全 Codex アカウントの現在の残量を取得（推論リクエストの消費なし）"))
     a.set_defaults(func=cmd_limits)
 
     a = sub.add_parser("load", aliases=["use"], help=T("switch to an account by alias (unique prefix ok)","alias でアカウントに切り替え（一意な先頭文字列で可）"))

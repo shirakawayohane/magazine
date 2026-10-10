@@ -42,7 +42,7 @@ Restart an existing monitor after an update so it loads the new code.
 
 ## Codex setup
 
-magazine v0.1.1 uses the default user `.codex/auth.json` and `.codex/sessions` locations.
+magazine v0.1.2 uses the default user `.codex/auth.json` and `.codex/sessions` locations.
 It does not implement custom `CODEX_HOME`, keyring-only authentication, or API-key account rotation.
 
 OpenAI supports several [credential storage modes](https://learn.chatgpt.com/docs/auth#credential-storage).
@@ -87,8 +87,8 @@ log the provider CLI out of an already active session.
 
 | Operation | Data source / side effects |
 | --- | --- |
-| `mag limits`, `mag status` | Claude usage endpoint; can refresh stored inactive credentials. Codex normally reads local session records or previously observed usage |
-| `mag limits --refresh` | Also probes inactive Codex accounts by making a small Codex request in a temporary profile; consumes some usage |
+| `mag limits`, `mag status` | Claude usage endpoint; can refresh stored inactive credentials. Codex uses recent observations and fetches current limits for the active account when missing, at least 60 seconds old, or past reset |
+| `mag limits --refresh` | Fetches current limits for all Codex accounts through Codex app-server, including the active account; no inference request |
 | Claude status-line hook | Reads the JSON Claude Code provides; the hook itself makes no additional API request |
 | `mag watch` | Reads status-line and Codex session records, periodically checks Claude usage, and can pre-check a spare Claude account with a small model request |
 | `mag use`, `mag next`, `mag auto` | Can refresh expired stored credentials; `next` and `auto` can check Claude usage unless `--no-probe` is used |
@@ -98,23 +98,26 @@ log the provider CLI out of an already active session.
 an account requires refreshing its credentials. No magazine-operated server or analytics
 collector is used. Requests go to the relevant provider, or through that provider's CLI.
 
-Codex usage depends on recorded events. An account can show “never observed” until it
-has been used, or until an explicit refresh succeeds. Previously observed values are
-marked with a timestamp and can be stale.
+Codex usage is read through the installed CLI's `account/rateLimits/read` API in an
+isolated temporary profile. It needs a CLI supporting external ChatGPT tokens and a
+valid access token. This lookup does not run a model, rotate refresh tokens, or change
+the running Codex session. If authentication needs renewal, the display explains it;
+other lookup failures remain usage errors, not proof that the account is unusable.
+Inactive accounts show their saved observations until `mag limits --refresh` succeeds.
 
 Both `mag status` and `mag limits` reuse the last saved Codex usage when no newer
 reading is available, including for inactive accounts and just after switching back.
 They label it “last seen” / “current usage unknown”; the percentage is not reset to
 zero when its recorded reset time passes. Observation timestamps come from the Codex
-record, not the time you display it. Older snapshots saved by previous magazine versions
+record or successful API lookup, not the time you display it. Older snapshots saved by previous magazine versions
 retain their original timestamps, which may represent when magazine read the record.
 An explicit `mag limits --refresh` failure keeps the previous value alongside the error.
 `mag status --quick` still skips usage reads.
 
 Usage snapshots share the existing account-specific `state.json` storage. Switching
 away also saves available usage before replacing the active credentials, provided the
-active account matches magazine's tracked account. This uses the existing local session
-reader, not an extra provider request. Its cost is one directory traversal and metadata
+active account matches magazine's tracked account. This uses the same lookup as the
+display, including a current-limits request when needed. The local reader costs one directory traversal and metadata
 lookup per session file, sorting that list, then reading at most the 20 most recently
 modified JSONL files. Inactive accounts only read their saved snapshots. Historical
 snapshots are for display, not evidence of current availability or an automatic-switch
@@ -131,6 +134,14 @@ from the account-wide window.
 Run `mag watch` in a separate terminal, or enable the installer-provided background service.
 The monitor switches accounts when reported usage reaches the threshold. It does not
 prevent all rate-limit interruptions or enforce a billing cap; usage may change between checks.
+
+An explicit `mag use <name>` keeps that account selected until an account-wide
+usage window reaches **100%**, even if the configured switching threshold is lower.
+This applies to both background monitoring and the pre-launch check, and survives
+monitor restarts. Selecting an account also clears its previous cooldown; using
+the same name again reaffirms the choice. For Claude, a status-line limit must be
+confirmed against that account's usage before it can override a manual selection.
+After switching to another account, the usual thresholds apply again.
 
 Configuration is read from `config.json` in the magazine data directory:
 
