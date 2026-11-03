@@ -25,7 +25,7 @@ switches. `mag main clear` puts things back the way they were.
 Nothing changes for existing installations until you run `mag main`.
 macOS and Linux only for the relay; Windows keeps replacing the login on each switch.
 
-Validated with 215 regression tests and the offline CLI walkthrough, plus a live macOS
+Validated with 216 regression tests and the offline CLI walkthrough, plus a live macOS
 check through Claude Code 2.1.317. See the
 [verification notes](https://github.com/shirakawayohane/magazine/blob/v0.1.3/docs/verification.md).
 

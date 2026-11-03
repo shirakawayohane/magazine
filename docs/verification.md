@@ -12,7 +12,7 @@ account, and switching changes only which account's usage conversation requests 
 `mag main clear` turns it off again. Claude subscriptions no longer report a five-hour
 window (`five_hour: null`); magazine now switches on the windows that are reported.
 
-- All 215 regression tests passed locally on macOS with Python 3.14 and with the
+- All 216 regression tests passed locally on macOS with Python 3.14 and with the
   monitor's Python 3.9.6, together with the offline CLI walkthrough, Python syntax
   check, shell syntax check, and diff whitespace check.
 - Relay tests cover which requests are re-signed (`POST /v1/messages*` only, and only

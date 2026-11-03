@@ -8,6 +8,7 @@ import socket
 import tempfile
 import threading
 import time
+import unittest
 
 from test_mag import Base, mag
 
@@ -182,6 +183,7 @@ class Switching(RelayBase):
         mag.reconcile_current()
         self.assertEqual(mag.get_current("claude"), "spare")
 
+    @unittest.skipIf(mag.IS_WINDOWS, "the relay is not available on Windows")
     def test_changing_main_moves_the_login(self):
         self.add_account("other")
         self.store["other"] = oauth("sk-ant-oat-other")
@@ -276,9 +278,11 @@ class RefreshLock(Base):
         for t in threads:
             t.join()
         self.assertEqual(calls, ["rt1"])
+        self.assertEqual(len(out), 3)                      # no thread died on the lock
         self.assertEqual({o["accessToken"] for o in out}, {"new"})
 
 
+@unittest.skipIf(mag.IS_WINDOWS, "the relay is not available on Windows")
 class OnOff(RelayBase):
     def setUp(self):
         super().setUp()
@@ -341,4 +345,16 @@ class OnOff(RelayBase):
     def test_on_requires_a_main_account(self):
         mag.set_main(None, "claude")
         self.assertEqual(self.relay("on"), 1)
+        self.assertFalse(mag.relay_enabled())
+
+
+class WindowsMain(RelayBase):
+    def test_main_without_relay_on_windows(self):
+        mag.set_relay_enabled(False)
+        mag.set_main(None, "claude")
+        self.patch("IS_WINDOWS", True)
+        self.patch("relay_turn_on", lambda: self.fail("relay started on Windows"))
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(mag.cmd_main(argparse.Namespace(name="main", provider=None)), 0)
+        self.assertEqual(mag.main_slug("claude"), "main")
         self.assertFalse(mag.relay_enabled())

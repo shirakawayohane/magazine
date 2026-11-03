@@ -601,9 +601,8 @@ def file_lock(path: str):
     with open(path, "a+") as f:
         if os.name == "nt":
             import msvcrt
-            if os.fstat(f.fileno()).st_size == 0:
-                f.write("0")
-                f.flush()
+            # 中身は書かない: 他のスレッドが鍵をかけた範囲へ書くと PermissionError になる。
+            # Windows はファイル末尾より先のバイトにも鍵をかけられる。
             f.seek(0)
             while True:
                 try:
