@@ -187,7 +187,9 @@ How it works:
   after either.
 - The relay listens on `127.0.0.1:47821` (`relay_port` in `config.json`) inside
   `mag watch`, so the monitor must be running. If it is not, Claude Code cannot connect
-  and retries; `mag relay off` puts things back.
+  and retries, and HTTPS commands Claude Code runs (`git push`, `gh`, `curl`) fail too,
+  because they inherit the proxy setting. Restarting the monitor leaves a gap of about
+  a second. `mag main clear` (or `mag relay off`) puts things back.
 - To see and rewrite requests to `api.anthropic.com`, the relay uses a local certificate
   authority created with `openssl`. It is name-constrained to `api.anthropic.com`, its
   private key is deleted after signing, and only Claude Code is told to trust it.
