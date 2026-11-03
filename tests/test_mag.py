@@ -25,6 +25,7 @@ import unittest
 _TMP_HOME = tempfile.mkdtemp(prefix="magazine-test-")
 os.environ["MAGAZINE_HOME"] = _TMP_HOME
 os.environ["MAGAZINE_LANG"] = "en"
+os.environ["MAGAZINE_NO_UPDATE_CHECK"] = "1"   # tests never ask GitHub; test_update_check opts back in
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SPEC = importlib.util.spec_from_file_location("mag", os.path.join(_HERE, "..", "mag.py"))
@@ -52,6 +53,14 @@ class Base(unittest.TestCase):
         # ネットワークに出る口を塞ぐ。使うテストでは個別に差し替える。
         self.patch("http_json", self._no_network)
         self.patch("log", lambda *a, **k: None)
+        home = tempfile.TemporaryDirectory(prefix="magazine-codex-test-")
+        self.addCleanup(home.cleanup)
+        self.patch("CODEX_AUTH_PATH", os.path.join(home.name, "auth.json"))
+        self.patch("codex_apply_selection", lambda: True)
+        # Claude Code の本物の設定（~/.claude/settings.json）には決して触れない
+        claude_home = os.path.join(home.name, "claude")
+        os.makedirs(claude_home, exist_ok=True)
+        self.patch("claude_config_dir", lambda: claude_home)
 
     def tearDown(self):
         for name, original in reversed(self._patched):
@@ -354,17 +363,13 @@ class CodexIdentity(Base):
 
 
 class CodexSwitchNotice(Base):
-    """切り替えても、開いている codex セッションは次のターンまで前のアカウントで走る。
-
-    実測: mag が切り替えたあとも十数分は前のアカウントの数値が記録され続け、
-    その間に上限メッセージが1回出る。黙って切り替えると「切り替えたのに上限」に
-    見えるので、開いているセッションがありそうなときだけ一言添える。
-    """
+    """共有サーバーでは画面を開き直すだけで認証が切り替わるとは限らない。"""
 
     def setUp(self):
         super().setUp()
         self.sessions = tempfile.mkdtemp(prefix="codex-sessions-")
         self.patch("CODEX_SESSIONS_DIR", self.sessions)
+        self.patch("codex_daemon_socket", lambda: os.path.join(self.sessions, "server.sock"))
         self.addCleanup(shutil.rmtree, self.sessions, ignore_errors=True)
 
     def write_session(self, name, age_seconds):
@@ -387,6 +392,12 @@ class CodexSwitchNotice(Base):
     def test_no_sessions_directory_is_not_an_error(self):
         self.patch("CODEX_SESSIONS_DIR", os.path.join(self.sessions, "nope"))
         self.assertFalse(mag.codex_session_recently_active())
+
+    def test_shared_server_alone_requires_a_notice(self):
+        with open(mag.codex_daemon_socket(), "w"):
+            pass
+        note = mag.codex_switch_note("fd-codex")
+        self.assertIsNone(note)  # The shared server is updated without reopening sessions.
 
     def test_the_note_is_only_for_codex(self):
         self.write_session("s.jsonl", 30)

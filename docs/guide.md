@@ -40,10 +40,16 @@ To update a development clone, use `git pull --ff-only` and run its installer ag
 For a release clone, fetch tags and check out the release you want before reinstalling.
 Restart an existing monitor after an update so it loads the new code.
 
+Once a day, the first `mag` command you run asks GitHub in the background whether a
+newer release exists (nothing else is sent). The next command in a terminal then
+prints the update command once a day. Set `"update_check": false` in `config.json`, or
+`MAGAZINE_NO_UPDATE_CHECK=1`, to turn this off.
+
 ## Codex setup
 
-magazine v0.1.2 uses the default user `.codex/auth.json` and `.codex/sessions` locations.
-It does not implement custom `CODEX_HOME`, keyring-only authentication, or API-key account rotation.
+Magazine uses the file-based Codex credential store and session directory under
+`CODEX_HOME` (default: `.codex` in the user's home directory). It does not implement
+keyring-only authentication or API-key account rotation.
 
 OpenAI supports several [credential storage modes](https://learn.chatgpt.com/docs/auth#credential-storage).
 If your environment permits file storage, select this in your Codex configuration before
@@ -57,8 +63,50 @@ Do not override an organization's authentication requirements. If you need keyri
 storage or a managed login that does not expose this file, this magazine release is not
 compatible with that setup.
 
-After switching, start Codex again. magazine writes the selected login; it does not
-restart or inject credentials into an already running Codex process.
+Running Codex processes can retain the old login even after the credential file
+changes. Magazine now applies account changes to the shared server without
+restarting it or reopening conversations:
+
+```sh
+mag use codex-main
+```
+
+The command starts a background authentication monitor and returns without waiting
+for ongoing work. `mag next --provider codex`, `mag auto`, and `mag watch` use the
+same path. Selecting the current alias again repairs a stopped monitor. Further
+selections replace the saved login; the monitor always applies the latest file.
+The monitor waits for loaded conversations to finish, including turns awaiting
+approval, before applying a different login. Account handover can change Codex's
+application network permissions, so it is not applied in the middle of active work.
+While waiting, renewal requests for the older running account use its existing
+vault slot without overwriting the newly selected file. Failed turns can be repaired
+without reopening the conversation.
+
+The idle check and handover are not atomic: a new turn starting immediately between
+them can still be affected by Codex's permission update. This does not guarantee
+uninterrupted inference. Detached background commands are not represented by the
+conversation-status check.
+
+**Keep the authentication monitor running.** Codex's external-token mode makes
+magazine responsible for renewal. The monitor renews tokens five minutes before
+expiry, handles Codex's renewal requests, saves rotated credentials in the normal
+file and account vault, and reconnects after connection loss. The monitor is
+separate from `mag watch`; disabling usage-based rotation does not stop token renewal.
+
+`mag status` reports pending application, active monitoring, reconnection, or a
+renewal problem. If the monitor has stopped or you reboot, run `mag use codex-main`
+again. Temporary renewal failures are retried. If credentials have been revoked,
+run `mag login codex codex-main`, then `mag use codex-main`. Stopping the monitor
+while the shared server remains in external-token mode can cause authentication
+errors once its current access token expires.
+
+This integration uses Codex's experimental `chatgptAuthTokens` protocol over its
+Unix control socket and was tested with Codex **0.162.1** on macOS. Compatible Unix
+shared servers are required. If no socket exists, magazine does not start one;
+new sessions use the saved file normally. Separate standalone, IDE, and Desktop
+servers are not updated and may still require their own restart. Older Codex
+versions and Windows live handover have not been verified. Magazine does not
+fall back to automatically restarting an unsupported server.
 
 ## Account management
 
@@ -83,6 +131,78 @@ account when the verified identity does not match.
 `mag remove <name>` removes the saved account and its stored credentials. It does not
 log the provider CLI out of an already active session.
 
+### Main account
+
+Some work stays with the account that created it — Claude Code Artifacts, for example,
+are owned by the account that was signed in when they were published. Rotating through
+spares scatters that work. Mark the account where it should live:
+
+```sh
+mag main main            # one main account per provider
+mag main codex-main
+mag main                 # show the current main accounts
+mag main clear           # unset (Claude: also turns the relay off)
+mag main clear codex     # unset only one provider
+```
+
+For Claude, `mag main` also turns on the [relay](#relay-switch-only-the-usage): Claude Code
+stays signed in to the main account and switching moves only the usage. Without the
+relay (Windows, `mag relay off`), switching replaces the Claude Code login as before.
+
+The main account is marked with ★ in `mag status` and `mag limits`. When magazine
+picks the next account (`mag next`, the monitor, the pre-launch check), a usable main
+account comes first. While a spare is in use, `mag watch` switches back to the main
+account as soon as it is usable again, checked on its usage-API interval (default
+5 minutes). For Claude the main account's own usage must be below `hotswap_threshold`;
+for Codex its recorded cooldown must have ended. `mag auto` returns to the main account
+only when it may check usage (not with `--no-probe`). A spare you picked with
+`mag use` is left alone until it runs out.
+
+Artifacts are published with the same login as the conversation, so one made while
+a spare is active still belongs to that spare. Returning to the main account quickly
+keeps that window short; it does not move Artifacts that already exist. This applies
+only when the relay is off.
+
+### Relay: switch only the usage
+
+```sh
+mag main main      # sets the main account and turns the relay on
+mag relay status
+mag relay off      # back to replacing the Claude Code login on every switch
+mag relay on       # turn it back on for the current main account
+```
+
+With the relay on, Claude Code is always signed in to the main account. Only its
+conversation requests (`POST /v1/messages`) are sent with the credential of the account
+whose usage is being spent (▶ in `mag status`). Artifacts, Remote Control, plugins,
+and every other request keep the main account's login. Switching (`mag use`, `mag next`,
+the monitor) changes only that paying account, and takes effect on the next request
+without touching the Claude Code login.
+
+How it works:
+
+- Turning the relay on (`mag main` or `mag relay on`) adds `HTTPS_PROXY`, `NODE_EXTRA_CA_CERTS`, and `NO_PROXY` to the `env`
+  of Claude Code's `settings.json` (backed up first), and signs Claude Code in to the
+  main account. `mag relay off` restores the previous values. Restart open sessions
+  after either.
+- The relay listens on `127.0.0.1:47821` (`relay_port` in `config.json`) inside
+  `mag watch`, so the monitor must be running. If it is not, Claude Code cannot connect
+  and retries; `mag relay off` puts things back.
+- To see and rewrite requests to `api.anthropic.com`, the relay uses a local certificate
+  authority created with `openssl`. It is name-constrained to `api.anthropic.com`, its
+  private key is deleted after signing, and only Claude Code is told to trust it.
+- The environment is inherited by commands Claude Code runs. The relay opens only
+  connections made by the Claude Code program itself; other programs (curl, Python,
+  git…) are tunnelled unchanged, so their certificate checks are unaffected.
+- A request is rewritten only when it carries the main account's own login. A
+  credential the caller chose (for example the spare pre-check) is left alone. If the
+  paying account's credential cannot be used, the request goes out on the main account
+  and you are notified.
+- It cannot be combined with another HTTPS proxy, and is not available on Windows yet.
+
+Pointing Claude Code at the relay with `ANTHROPIC_BASE_URL` instead was tested and
+rejected: Claude Code then turns off Remote Control and some tools.
+
 ## Usage data and network access
 
 | Operation | Data source / side effects |
@@ -90,9 +210,10 @@ log the provider CLI out of an already active session.
 | `mag limits`, `mag status` | Claude usage endpoint; can refresh stored inactive credentials. Codex uses recent observations and fetches current limits for the active account when missing, at least 60 seconds old, or past reset |
 | `mag limits --refresh` | Fetches current limits for all Codex accounts through Codex app-server, including the active account; no inference request |
 | Claude status-line hook | Reads the JSON Claude Code provides; the hook itself makes no additional API request |
-| `mag watch` | Reads status-line and Codex session records, periodically checks Claude usage, and can pre-check a spare Claude account with a small model request |
+| `mag watch` | Reads status-line and Codex session records, periodically checks Claude usage, and can pre-check a spare Claude account with a small model request; Codex switches also start the separate authentication monitor |
 | `mag use`, `mag next`, `mag auto` | Can refresh expired stored credentials; `next` and `auto` can check Claude usage unless `--no-probe` is used |
 | `mag add`, `mag login`, `mag update` | Provider authentication/profile operations; `login` opens the provider's own login flow |
+| Any command, once a day | Asks the GitHub releases API for the latest magazine release in the background (`update_check`) |
 
 `--no-probe` skips usage probing. It does not promise zero network traffic if activating
 an account requires refreshing its credentials. No magazine-operated server or analytics
@@ -148,12 +269,13 @@ Configuration is read from `config.json` in the magazine data directory:
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `hotswap_threshold` | `97.0` | Reported usage percentage at which the monitor considers switching |
-| `five_hour_threshold` | `99.5` | Five-hour usage threshold when selecting candidates with probing |
+| `five_hour_threshold` | `99.5` | Five-hour usage threshold when selecting candidates with probing; Claude subscriptions no longer report a five-hour window, so it applies only when one is reported |
 | `seven_day_threshold` | `99.5` | Weekly usage threshold when selecting candidates with probing |
-| `warm_threshold` | `50.0` | Claude five-hour usage that triggers a spare-account pre-check |
+| `warm_threshold` | `50.0` | Claude usage (highest reported window) that triggers a spare-account pre-check |
 | `warm_model` | `claude-haiku-4-5-20251001` | Model used for that pre-check; availability depends on the provider |
 | `min_switch_interval` | `20` | Minimum interval in seconds for the Claude hot-swap guard |
 | `poll_schedule` | `[[90, 3], [80, 8], [0, 20]]` | Usage threshold / seconds between local checks |
+| `update_check` | `true` | Check GitHub for a newer release once a day |
 
 For example, `{"hotswap_threshold": 95.0, "warm_threshold": 101.0}` switches earlier
 and prevents the usual 0–100% usage signal from triggering a model pre-check.

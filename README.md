@@ -23,7 +23,10 @@ resume preview, not a live AI session. [Text version and reproduction](docs/demo
   when reported usage reaches a threshold.
 - **Find interrupted work.** `mag stalled` locates Claude Code sessions with recorded
   limit or login errors. `mag resume` selects an account and opens the existing session.
-- **Small install.** One Python script, standard library only. No proxy server or
+- **Keep your work on one account.** After `mag main ALIAS`, Claude Code stays signed in to
+  that main account — Artifacts, Remote Control, and everything else stay there — while
+  only the usage moves between accounts. [How the relay works](docs/guide.md#relay-switch-only-the-usage).
+- **Small install.** One Python script, standard library only. No proxy server until you choose a main account, and no
   extra Python packages. Optional shell integration checks accounts before launching
   the usual CLI.
 
@@ -31,7 +34,7 @@ resume preview, not a live AI session. [Text version and reproduction](docs/demo
 | --- | --- | --- |
 | Account registration and switching | Yes | Yes; subscription login with file storage |
 | Usage | Provider usage endpoint and status-line data | Codex account limits API and local session records |
-| Switching a running session | Can be picked up by Claude Code; timing depends on its credential cache/version | Start Codex again to use the selected account |
+| Switching a running session | Can be picked up by Claude Code; timing depends on its credential cache/version | `mag use` applies the login to the shared server once all conversations are idle |
 | Interrupted-session discovery and resume | Yes, for recognized local session records | Not implemented |
 
 Switching stays within each provider. It does not move a Claude conversation into
@@ -46,7 +49,7 @@ On macOS/Linux, the Python command must be `python3`; on Windows, `python.exe`.
 Clone the tagged release so you can inspect the installer before running it:
 
 ```sh
-git clone --branch v0.1.2 --depth 1 https://github.com/shirakawayohane/magazine.git
+git clone --branch v0.1.3 --depth 1 https://github.com/shirakawayohane/magazine.git
 cd magazine
 ```
 
@@ -90,7 +93,8 @@ codex login
 mag add codex-main --provider codex
 ```
 
-**Codex prerequisite:** this release reads the default `auth.json` location.
+**Codex prerequisite:** this release reads the file-based `auth.json` credential store
+(the default location, or under `CODEX_HOME`).
 Custom `CODEX_HOME`, keyring-only storage, and API-key accounts are not supported.
 Check the [Codex setup notes](docs/guide.md#codex-setup) before registering an account.
 
@@ -105,8 +109,17 @@ mag limits
 mag use spare
 ```
 
+Keep Artifacts and other saved work on one account with `mag main main`. Claude Code
+stays signed in to it, and switching moves only whose usage is spent; rotation returns
+to the main account's usage as soon as it is usable again. [Main account](docs/guide.md#main-account).
+
 Use unique names across both providers. `mag login` leaves the active account in place;
-`mag use` changes it. For Codex, restart the CLI after switching.
+`mag use` changes it. Codex account changes, including automatic rotation, are
+applied to the shared server without restarting it or reopening conversations.
+Magazine starts a background authentication monitor that must remain running to
+renew tokens. It also reconnects after the shared server restarts. Check confirmation
+and monitor health with `mag status`; run `mag use <alias>` again if the monitor stops.
+Separate standalone Codex processes still need their own restart.
 
 ### Optional: switch as usage approaches its limit
 

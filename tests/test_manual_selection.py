@@ -8,7 +8,9 @@ from unittest.mock import patch
 from test_mag import Base, mag
 
 
-class ManualSelection(Base):
+class Fixture(Base):
+    """Accounts and stubs shared with other test modules (no tests here)."""
+
     def setUp(self):
         super().setUp()
         for slug in ("main", "fourdesign"):
@@ -19,16 +21,21 @@ class ManualSelection(Base):
         self.patch("ensure_fresh", lambda slug, oauth: oauth)
         self.patch("sync_live_credentials", lambda: None)
         self.patch("install_oauth", lambda oauth: None)
-        self.patch("codex_stored_auth", lambda slug: {"tokens": {"access_token": slug}})
+        self.patch("codex_stored_auth", lambda slug: {"tokens": {"access_token": slug, "account_id": slug}})
+        self.patch("codex_live_auth", lambda: {"tokens": {"account_id": mag.get_current("codex")}})
+        self.patch("codex_apply_selection", lambda: True)
         self.patch("codex_ensure_fresh", lambda slug, auth, **kw: (auth, None, True))
         self.patch("codex_sync_live", lambda: None)
         self.patch("codex_install_auth", lambda auth: None)
         self.patch("print_codex_switch_note", lambda *args: None)
+        self.relay_calls = []                          # `mag main` turns the relay on; tested in test_relay
+        self.patch("relay_turn_on", lambda: self.relay_calls.append("on") or 0)
+        self.patch("relay_turn_off", lambda: self.relay_calls.append("off") or 0)
         self.patch("reconcile_current", lambda: {})
         self.patch("mark_watch_alive", lambda **kw: None)
         self.patch("notify", lambda *args: None)
         self.patch("live_worst", lambda: None)
-        self.patch("live_five_hour_pct", lambda: None)
+        self.patch("live_peak_pct", lambda: None)
         self.patch("codex_worst", lambda **kw: None)
         self.usage = {"main": self.reading(98), "fourdesign": self.reading(98)}
         self.patch("probe", lambda slug, **kw: self.usage[slug])
@@ -55,6 +62,8 @@ class ManualSelection(Base):
             self.assertEqual(mag.cmd_watch(argparse.Namespace(
                 threshold=threshold, interval=20, api_interval=0)), 0)
 
+
+class ManualSelection(Fixture):
     def test_manual_use_clears_old_cooldown_and_survives_prelaunch(self):
         mag.set_current("claude", "main")
         mag.set_cooldown("fourdesign", "seven_day", time.time() + 3600)

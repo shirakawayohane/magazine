@@ -47,6 +47,7 @@ def capture():
             return forbidden()
 
         mag.http_json = fake_http
+        mag.update_check_enabled = lambda: False      # offline walkthrough: never ask GitHub
         scenes = []
 
         def command(title, argv, seconds=6, note=""):

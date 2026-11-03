@@ -19,19 +19,25 @@ claude-magazine — 複数の Claude Max アカウントを「弾倉」のよう
   1. statusLine 経由 … Claude Code が statusLine に渡す rate_limits（追加コストなし）
   2. usage API      … https://api.anthropic.com/api/oauth/usage
 
-CLI 本体には干渉しない。端末を横取りしたり、走っているプロセスを止めたりはしない。
+端末を横取りしたり、走っているプロセスを止めたりはしない。
+Codex の共有サーバーには、常駐処理から認証情報の反映と更新を行う。
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import hashlib
 import json
 import os
 import queue
 import re
+import select
 import shutil
+import socket
+import ssl
+import struct
 import subprocess
 import sys
 import threading
@@ -42,7 +48,7 @@ import urllib.request
 import uuid
 from datetime import datetime, timedelta, timezone
 
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 
 HOME = os.path.expanduser("~")
 
@@ -145,7 +151,7 @@ UA = "claude-cli/2.1.220 (external, cli)"
 # ── Codex (ChatGPT) ─────────────────────────────────────────────────────
 # Claude と違い認証は Keychain ではなく ~/.codex/auth.json（平文）に入る。
 # 弾倉側の保管は Keychain（service=claude-magazine-codex）にして平文コピーを増やさない。
-CODEX_AUTH_PATH = os.path.expanduser("~/.codex/auth.json")
+CODEX_AUTH_PATH = os.path.join(os.path.abspath(os.path.expanduser(os.environ.get("CODEX_HOME", "~/.codex"))), "auth.json")
 CODEX_MAG_SERVICE = "claude-magazine-codex"
 CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token"
@@ -181,6 +187,10 @@ DEFAULT_CONFIG = {
     "warm_model": "claude-haiku-4-5-20251001",
     # 上限で落ちた後の再開時、自動で送信するプロンプト（空なら送らない）
     "auto_continue_prompt": "",
+    # 1 日 1 回、新しいリリースが出ていないか確認する（GitHub に問い合わせるだけ）
+    "update_check": True,
+    # 中継（mag relay）の待ち受けポート（127.0.0.1 のみ）
+    "relay_port": 47821,
 }
 
 # ── 小物 ────────────────────────────────────────────────────────────────
@@ -584,6 +594,37 @@ def is_live_oauth(oauth: dict) -> bool:
     return bool(rt) and (current_oauth() or {}).get("refreshToken") == rt
 
 
+@contextlib.contextmanager
+def file_lock(path: str):
+    """プロセス間・スレッド間の排他（ファイルごとに別の fd を開くので両方に効く）。"""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a+") as f:
+        if os.name == "nt":
+            import msvcrt
+            if os.fstat(f.fileno()).st_size == 0:
+                f.write("0")
+                f.flush()
+            f.seek(0)
+            while True:
+                try:
+                    msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.05)
+            try:
+                yield
+            finally:
+                f.seek(0)
+                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(f, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
+
+
 def ensure_fresh(slug: str | None, oauth: dict) -> dict:
     """期限切れ間近なら refresh し、保管庫にも書き戻す。
 
@@ -599,13 +640,22 @@ def ensure_fresh(slug: str | None, oauth: dict) -> dict:
         return oauth
     if is_live_oauth(oauth):
         return oauth
-    new = refresh_oauth(oauth)
-    if not new:
-        return oauth
-    if slug:
+    if not slug:
+        return refresh_oauth(oauth) or oauth
+    # refresh token は使い捨て。中継・常駐監視・手で打った mag が同時に更新すると、
+    # 負けた側のトークンが失効する。プロセスをまたいで 1 人ずつにし、
+    # 鍵を取れたら保管庫を読み直す（先に誰かが更新していればそれを使う）。
+    with file_lock(os.path.join(ROOT, "locks", f"refresh-{slug}.lock")):
+        latest = stored_oauth(slug) or oauth
+        exp = latest.get("expiresAt")
+        if exp and (exp / 1000.0) - now() > 120:
+            return latest
+        new = refresh_oauth(latest)
+        if not new:
+            return latest
         store_oauth(slug, new)
         log(f"refresh: {slug} のトークンを更新しました（現用ではない弾）")
-    return new
+        return new
 
 
 def fetch_usage(oauth: dict) -> dict:
@@ -653,6 +703,19 @@ def usage_summary(u: dict) -> dict:
         "monthly_limit": eu.get("monthly_limit"),
     }
     return out
+
+
+WINDOW_LABEL = {"five_hour": "5h", "seven_day": "7d"}
+
+
+def peak_window(p: dict | None) -> tuple[str | None, float | None]:
+    """probe 結果のうち、報告されている枠で最も逼迫したもの (kind, pct)。"""
+    best = (None, None)
+    for k in ("five_hour", "seven_day"):
+        pct = ((p or {}).get(k) or {}).get("pct")
+        if pct is not None and (best[1] is None or pct > best[1]):
+            best = (k, pct)
+    return best
 
 
 # ── Codex: 認証スロットの読み書き ───────────────────────────────────────
@@ -711,7 +774,7 @@ def codex_identity(auth: dict) -> dict:
     }
 
 
-def codex_refresh(auth: dict) -> tuple[dict | None, str | None]:
+def codex_refresh(auth: dict, timeout: float = 20) -> tuple[dict | None, str | None]:
     """(更新後の auth, 失効理由) を返す。
 
     OpenAI の refresh token は 1 回使うたびに新しいものへ回り、古い方は
@@ -729,7 +792,7 @@ def codex_refresh(auth: dict) -> tuple[dict | None, str | None]:
         req = urllib.request.Request(
             CODEX_TOKEN_URL, data=json.dumps(body).encode(),
             headers={"Content-Type": "application/json", "User-Agent": CODEX_UA})
-        with urllib.request.urlopen(req, timeout=20) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             j = json.loads(r.read().decode())
     except urllib.error.HTTPError as e:
         if e.code not in (400, 401):
@@ -780,6 +843,11 @@ def codex_ensure_fresh(slug: str | None, auth: dict, verify: bool = False) -> tu
 
 
 def codex_sync_live() -> str | None:
+    with codex_auth_lock():
+        return _codex_sync_live()
+
+
+def _codex_sync_live() -> str | None:
     """現用の auth.json を、持ち主の保管スロットへ書き戻す。
 
     codex 本体もトークンを更新するので、その瞬間に保管庫のスナップショットは
@@ -810,7 +878,7 @@ def codex_sync_live() -> str | None:
     return None
 
 
-CODEX_SESSIONS_DIR = os.path.expanduser("~/.codex/sessions")
+CODEX_SESSIONS_DIR = os.path.join(os.path.dirname(CODEX_AUTH_PATH), "sessions")
 
 
 def codex_session_recently_active(within: float = 1800) -> bool:
@@ -835,20 +903,480 @@ def codex_session_recently_active(within: float = 1800) -> bool:
 
 
 def codex_switch_note(name: str) -> str | None:
-    """切り替え直後に出す一言。開いているセッションが無さそうなら黙る。
-
-    codex は認証をターンの区切り（と認証エラーからの復帰）でしか読み直さない。
-    そのため開いているセッションは次のターンまで前のアカウントのまま走り、
-    その間に上限メッセージが出ることがある。実測では切り替えから反映まで
-    十数分かかり、「切り替えたのに上限と言われる」と見える。
-    """
-    if not codex_session_recently_active():
+    if os.path.lexists(codex_daemon_socket()) or not codex_session_recently_active():
         return None
-    return T(f"  note: an open codex session keeps using the previous account until its next turn "
-             f"(a limit message may show up once). Start a new session — or `codex resume` — to use {name} right away.",
-             f"  注: 開いている codex セッションは、次のターンまで前のアカウントのまま動きます"
-             f"（上限メッセージが1回出ることがあります）。すぐ {name} で使うなら、"
-             f"新しいセッションを開くか `codex resume` で開き直してください。")
+    return T(f"  note: standalone Codex processes may still use the previous account instead of {name}. "
+             "Only the default shared server supports switching without restarting.",
+             f"  注: 独立して動く Codex は {name} に切り替わらない場合があります。"
+             "再起動せず切り替えられるのは共有サーバーです。")
+
+
+def codex_daemon_socket() -> str:
+    return os.path.join(os.path.dirname(CODEX_AUTH_PATH),
+                        "app-server-control", "app-server-control.sock")
+
+
+class CodexLocalRPC:
+    """Persistent local WebSocket; handles the auth host's refresh requests."""
+    def __init__(self, on_request=None):
+        self.on_request = on_request
+
+    def __enter__(self):
+        self.deadline = time.monotonic() + 8
+        self.sock = socket.socket(socket.AF_UNIX)
+        self.request_id = 0
+        try:
+            self.sock.settimeout(8)
+            self.sock.connect(os.path.realpath(codex_daemon_socket()))
+            key = base64.b64encode(os.urandom(16)).decode()
+            self.sock.sendall(("GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n"
+                               "Connection: Upgrade\r\nSec-WebSocket-Key: " + key +
+                               "\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+            header = b""
+            while not header.endswith(b"\r\n\r\n"):
+                if len(header) >= 8192:
+                    raise ValueError("oversized handshake")
+                header += self.read(1)
+            lines = header.decode("ascii").split("\r\n")
+            headers = {name.lower(): value.strip() for name, value in
+                       (line.split(":", 1) for line in lines[1:] if ":" in line)}
+            expected = base64.b64encode(hashlib.sha1(
+                (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+            if " 101 " not in lines[0] or headers.get("sec-websocket-accept") != expected:
+                raise ValueError("invalid websocket handshake")
+            self.rpc("initialize", {"clientInfo": {"name": "magazine", "version": VERSION},
+                                    "capabilities": {"experimentalApi": True}})
+            self.send({"method": "initialized", "params": {}})
+            return self
+        except Exception:
+            self.sock.close()
+            raise
+
+    def __exit__(self, *args):
+        self.sock.close()
+
+    def read(self, n):
+        data = b""
+        while len(data) < n:
+            remaining = self.deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError()
+            self.sock.settimeout(remaining)
+            chunk = self.sock.recv(n - len(data))
+            if not chunk:
+                raise OSError("server disconnected")
+            data += chunk
+        return data
+
+    def frame(self, data, opcode=1):
+        mask = os.urandom(4)
+        n = len(data)
+        if n > 65535:
+            raise ValueError("oversized outgoing message")
+        head = bytes([128 | opcode, 128 | n]) if n < 126 else bytes([128 | opcode, 254]) + struct.pack("!H", n)
+        self.sock.settimeout(8)
+        self.sock.sendall(head + mask + bytes(c ^ mask[i % 4] for i, c in enumerate(data)))
+
+    def send(self, message):
+        self.frame(json.dumps(message).encode())
+
+    def receive(self):
+        while True:
+            head = self.read(2)
+            n = head[1] & 127
+            if n == 126:
+                n = struct.unpack("!H", self.read(2))[0]
+            elif n == 127:
+                n = struct.unpack("!Q", self.read(8))[0]
+            if n > 4 * 1024 * 1024 or head[1] & 128 or head[0] & 112 or not head[0] & 128:
+                raise ValueError("unsupported websocket frame")
+            data = self.read(n)
+            opcode = head[0] & 15
+            if opcode == 9:
+                if n > 125:
+                    raise ValueError("invalid ping")
+                self.frame(data, 10)
+                continue
+            if opcode == 10:
+                continue
+            if opcode != 1:
+                raise ValueError("unexpected websocket frame")
+            message = json.loads(data)
+            if not isinstance(message, dict):
+                raise ValueError("invalid message")
+            return message
+
+    def dispatch(self, message):
+        if "method" not in message or "id" not in message:
+            return
+        try:
+            if self.on_request is None:
+                raise ValueError("unsupported server request")
+            result = self.on_request(message["method"], message.get("params") or {})
+            reply = {"id": message["id"], "result": result}
+        except Exception:
+            # Provider error text and request parameters may contain credentials.
+            reply = {"id": message["id"], "error": {"code": -32603,
+                     "message": "magazine could not renew authentication; check mag status"}}
+        self.send(reply)
+
+    def rpc(self, method, params):
+        self.request_id += 1
+        request_id = self.request_id
+        self.deadline = time.monotonic() + 8
+        self.send({"id": request_id, "method": method, "params": params})
+        while True:
+            message = self.receive()
+            if "method" in message:
+                self.dispatch(message)
+            elif message.get("id") == request_id:
+                if "error" in message or not isinstance(message.get("result"), dict):
+                    raise ValueError("request failed")
+                return message["result"]
+
+    def poll(self, timeout=1):
+        if select.select([self.sock], [], [], timeout)[0]:
+            self.deadline = time.monotonic() + 8
+            self.dispatch(self.receive())
+
+
+def codex_sync_state_path() -> str:
+    # Only coordination/health data. auth.json remains the credential source.
+    return os.path.join(ROOT, "codex-auth-sync.json")
+
+
+def codex_daemon_busy_count(client) -> int | None:
+    """Only when a handover is needed: N thread reads + two lists, max 500 threads."""
+    deadline = time.monotonic() + 8
+    try:
+        def loaded():
+            ids, cursor = set(), None
+            for _ in range(10):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError()
+                result = client.rpc("thread/loaded/list", {"cursor": cursor, "limit": 100})
+                data = result.get("data")
+                if not isinstance(data, list) or not all(isinstance(x, str) for x in data):
+                    raise ValueError("invalid thread list")
+                ids.update(data)
+                if len(ids) > 500:
+                    raise ValueError("too many threads")
+                cursor = result.get("nextCursor")
+                if cursor is None:
+                    return ids
+            raise ValueError("too many pages")
+        ids = loaded()
+        busy = 0
+        for thread_id in ids:
+            if time.monotonic() >= deadline:
+                raise TimeoutError()
+            result = client.rpc("thread/read", {"threadId": thread_id, "includeTurns": False})
+            status = result["thread"]["status"]["type"]
+            if status == "active":
+                busy += 1
+            elif status not in ("idle", "systemError"):
+                raise ValueError("unknown thread status")
+        return busy if ids == loaded() else None
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return None
+
+
+_CODEX_HELD_LOCKS = threading.local()
+
+
+@contextlib.contextmanager
+def codex_auth_lock(suffix=".mag.lock", blocking=True):
+    # Reentrant for refresh requests received while an auth RPC is in flight.
+    path = CODEX_AUTH_PATH + suffix
+    held = _CODEX_HELD_LOCKS.__dict__
+    if path in held:
+        yield held[path]
+        return
+    os.makedirs(os.path.dirname(CODEX_AUTH_PATH), exist_ok=True)
+    with open(path, "a+") as lock:
+        try:
+            if os.name == "nt":
+                import msvcrt
+                if os.fstat(lock.fileno()).st_size == 0:
+                    lock.write("0"); lock.flush()
+                lock.seek(0)
+                while True:
+                    try:
+                        msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError:
+                        if not blocking:
+                            raise BlockingIOError() from None
+                        time.sleep(0.05)
+            else:
+                import fcntl
+                fcntl.flock(lock, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        except BlockingIOError:
+            yield None
+        else:
+            held[path] = lock
+            try:
+                yield lock
+            finally:
+                del held[path]
+                if os.name == "nt":
+                    lock.seek(0)
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+
+
+def codex_sync_report(status, request_id=None):
+    with codex_auth_lock(".mag-state.lock"):
+        current = read_json(codex_sync_state_path(), {})
+        if request_id is not None and current.get("id") != request_id:
+            return
+        current.update(status=status, checked_at=now())
+        write_json(codex_sync_state_path(), current)
+
+
+def codex_apply_selection() -> bool:
+    """Start one persistent auth host. Never restart Codex or stop conversations."""
+    if not os.path.lexists(codex_daemon_socket()):
+        print(T("  No shared Codex server found. New sessions will use the saved login; "
+                "standalone processes need their own restart.",
+                "  Codex 共有サーバーは見つかりません。新しいセッションは保存した認証を使います。"
+                "独立して動くプロセスは再起動が必要です。"))
+        return True
+    try:
+        # Retire requests left by the previous deferred-restart implementation.
+        # A running legacy worker checks this queue before restarting anything.
+        legacy = os.path.join(ROOT, "codex-restart.json")
+        if os.path.exists(legacy):
+            import fcntl
+            with open(legacy + ".lock", "a+") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                old = read_json(legacy, {})
+                if old.get("status") == "pending":
+                    write_json(legacy, {**old, "status": "superseded"})
+        with codex_auth_lock(".mag-state.lock"):
+            write_json(codex_sync_state_path(), {"id": uuid.uuid4().hex, "status": "pending", "at": now()})
+            subprocess.Popen([sys.executable, os.path.abspath(__file__), "_codex-auth-worker"],
+                             env={**os.environ, "MAGAZINE_HOME": ROOT,
+                                  "CODEX_HOME": os.path.dirname(CODEX_AUTH_PATH)},
+                             cwd=ROOT, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+    except (OSError, ImportError):
+        with contextlib.suppress(OSError, ImportError):
+            codex_sync_report("failed")
+        print(T("  Login saved, but the authentication monitor could not start. Retry `mag use <alias>`.",
+                "  認証は保存済みですが、認証の常駐監視を起動できません。`mag use <alias>` を再実行してください。"),
+              file=sys.stderr)
+        return False
+    print(T("  Login saved. Once conversations finish, magazine will apply it without restarting Codex and keep its tokens fresh. "
+            "Check `mag status` for confirmation.",
+            "  認証を保存しました。会話の処理終了後、Codexを再起動せずに反映し、magazineが認証の更新を続けます。"
+            "`mag status` で反映状況を確認できます。"))
+    return True
+
+
+class CodexAuthError(Exception):
+    def __init__(self, status):
+        self.status = status
+        super().__init__(status)
+
+
+def codex_auth_tokens(auth):
+    tokens = (auth or {}).get("tokens") or {}
+    identity = codex_identity(auth)
+    account_id = tokens.get("account_id") or identity.get("account_id")
+    if not tokens.get("access_token") or not tokens.get("refresh_token") or not account_id:
+        raise CodexAuthError("reauthentication_required")
+    if auth.get("OPENAI_API_KEY") or auth.get("auth_mode") not in (None, "chatgpt"):
+        raise CodexAuthError("reauthentication_required")
+    return {"accessToken": tokens["access_token"], "chatgptAccountId": account_id,
+            "chatgptPlanType": identity.get("plan")}
+
+
+class CodexAuthSync:
+    def __init__(self):
+        self.applied = None
+        self.applied_auth = None
+        self.request_id = None
+        self.last_report = 0
+        self.failed_tokens = None
+        self.needs_refresh_for = None
+        self.next_idle_check = 0
+
+    def live(self, previous_account_id=None):
+        """Caller holds the shared selection/refresh lock."""
+        auth = codex_live_auth() or {}
+        tokens = codex_auth_tokens(auth)
+        signature = (tokens["accessToken"], (auth.get("tokens") or {}).get("refresh_token"))
+        if self.failed_tokens == signature:
+            raise CodexAuthError("reauthentication_required")
+        expires = jwt_claims(tokens["accessToken"]).get("exp")
+        unauthorized = (previous_account_id == tokens["chatgptAccountId"] and tokens == self.applied)
+        if unauthorized or (isinstance(expires, (int, float)) and expires <= now() + 300):
+            new, dead = codex_refresh(auth, timeout=6)
+            if dead:
+                self.failed_tokens = signature
+                raise CodexAuthError("reauthentication_required")
+            if not new:
+                raise CodexAuthError("refresh_failed")
+            # Save rotation before contacting the daemon; never resurrect an old token.
+            try:
+                codex_install_auth(new)
+                codex_sync_live()
+            except (OSError, RuntimeError):
+                raise CodexAuthError("storage_failed") from None
+            tokens = codex_auth_tokens(new)
+        return tokens
+
+    def refresh_request(self, method, params):
+        if method != "account/chatgptAuthTokens/refresh":
+            raise ValueError("unsupported server request")
+        try:
+            with codex_auth_lock():
+                tokens = self.refresh_runtime(params.get("previousAccountId"))
+                if self.applied and tokens["chatgptAccountId"] == self.applied["chatgptAccountId"]:
+                    # Codex installs a successful refresh response itself. Do
+                    # not run login/start again during the in-flight turn.
+                    self.applied = tokens
+                    live = codex_live_auth() or {}
+                    if codex_auth_tokens(live)["chatgptAccountId"] == tokens["chatgptAccountId"]:
+                        self.applied_auth = live
+                self.needs_refresh_for = None
+                return tokens
+        except CodexAuthError as exc:
+            self.needs_refresh_for = params.get("previousAccountId")
+            codex_sync_report(exc.status)
+            raise
+        except OSError:
+            self.needs_refresh_for = params.get("previousAccountId")
+            codex_sync_report("storage_failed")
+            raise
+
+    def refresh_runtime(self, previous_account_id):
+        current = codex_auth_tokens(codex_live_auth() or {})
+        if previous_account_id == current["chatgptAccountId"]:
+            return self.live(previous_account_id)
+        # A switch can be pending while an older account's turn finishes.
+        # Renew that turn's account without overwriting the selected file.
+        if not self.applied or previous_account_id != self.applied["chatgptAccountId"]:
+            raise CodexAuthError("reauthentication_required")
+        auth = self.applied_auth
+        owner = None
+        for account in accounts_of("codex"):
+            candidate = codex_stored_auth(account["slug"]) or {}
+            candidate_id = (candidate.get("tokens") or {}).get("account_id") or codex_identity(candidate).get("account_id")
+            if candidate_id == previous_account_id:
+                owner = account["slug"]
+                if (parse_iso(candidate.get("last_refresh")) or 0) > (parse_iso(auth.get("last_refresh")) or 0):
+                    auth = candidate
+                break
+        tokens = codex_auth_tokens(auth)
+        signature = (tokens["accessToken"], (auth.get("tokens") or {}).get("refresh_token"))
+        if self.failed_tokens == signature:
+            raise CodexAuthError("reauthentication_required")
+        if tokens["accessToken"] == self.applied["accessToken"]:
+            # Without a vault slot we cannot safely preserve this rotation
+            # while another account occupies the selected credential file.
+            if owner is None:
+                raise CodexAuthError("reauthentication_required")
+            new, dead = codex_refresh(auth, timeout=6)
+            if dead:
+                self.failed_tokens = signature
+                raise CodexAuthError("reauthentication_required")
+            if not new:
+                raise CodexAuthError("refresh_failed")
+            auth = new
+            tokens = codex_auth_tokens(new)
+        self.applied_auth = auth
+        if owner is not None:
+            try:
+                codex_store_auth(owner, auth)
+            except (OSError, RuntimeError):
+                raise CodexAuthError("storage_failed") from None
+        return tokens
+
+    def tick(self, client):
+        with codex_auth_lock():
+            request = read_json(codex_sync_state_path(), {})
+            if self.needs_refresh_for is not None:
+                self.refresh_runtime(self.needs_refresh_for)
+            self.needs_refresh_for = None
+            tokens = self.live()
+            if tokens != self.applied or self.request_id != request.get("id"):
+                if now() < self.next_idle_check:
+                    return
+                busy = codex_daemon_busy_count(client)
+                if busy != 0:
+                    codex_sync_report("pending", request.get("id"))
+                    self.next_idle_check = now() + 5
+                    return
+                self.next_idle_check = 0
+                # The lock covers both selection and RPC, so an older snapshot
+                # cannot be installed over a newly selected account.
+                try:
+                    codex_sync_live()
+                except (OSError, RuntimeError):
+                    raise CodexAuthError("storage_failed") from None
+                result = client.rpc("account/login/start", {"type": "chatgptAuthTokens", **tokens})
+                if result.get("type") != "chatgptAuthTokens":
+                    raise ValueError("external authentication not confirmed")
+                observed = client.rpc("getAuthStatus", {"includeToken": True, "refreshToken": False})
+                if observed.get("authToken") != tokens["accessToken"]:
+                    raise ValueError("authentication application unconfirmed")
+                self.applied = tokens
+                self.applied_auth = codex_live_auth()
+                self.request_id = request.get("id")
+                codex_sync_report("active", self.request_id)
+                self.last_report = now()
+            elif now() - self.last_report >= 10:
+                codex_sync_report("active", self.request_id)
+                self.last_report = now()
+
+
+def cmd_codex_auth_worker(args) -> int:
+    # One owner per auth file, including launch races and different terminals.
+    with codex_auth_lock(".mag-worker.lock", blocking=False) as worker:
+        if worker is None:
+            return 0
+        while True:
+            try:
+                sync = CodexAuthSync()
+                with CodexLocalRPC(on_request=sync.refresh_request) as client:
+                    retry_at = 0
+                    while True:
+                        if time.monotonic() >= retry_at:
+                            try:
+                                sync.tick(client)
+                            except CodexAuthError as exc:
+                                codex_sync_report(exc.status)
+                                retry_at = time.monotonic() + 5
+                        # Service server refresh requests even during retry backoff.
+                        client.poll(1)
+            except (OSError, ValueError, TypeError, KeyError, AttributeError):
+                # Keep the owner alive during daemon restarts / sleep / transport
+                # failure. No credentials or upstream error messages are logged.
+                codex_sync_report("reconnecting")
+                time.sleep(5)
+
+
+def print_codex_sync_status():
+    request = read_json(codex_sync_state_path(), {})
+    status = request.get("status")
+    if not status:
+        return
+    if now() - request.get("checked_at", request.get("at", 0)) > 30:
+        text = T("authentication monitor is not responding; retry mag use <alias>",
+                 "認証の常駐監視が応答していません。mag use <alias> を再実行してください")
+    else:
+        texts = {
+            "pending": T("authentication application pending; waiting for conversations to finish", "認証の反映待ち・会話の処理終了を待っています"),
+            "active": T("login applied without restart; authentication monitor active", "再起動せず認証を反映済み・認証の常駐監視が稼働中"),
+            "reconnecting": T("authentication monitor reconnecting; retry mag use <alias> if this persists", "認証の常駐監視が再接続中。続く場合はmag use <alias>を再実行してください"),
+            "refresh_failed": T("token renewal failed; checking network and retrying", "認証の更新に失敗。接続を確認しながら再試行中"),
+            "storage_failed": T("could not save renewed credentials; check the credential store, then retry mag use <alias>", "更新した認証を保存できません。認証の保管先を確認し、mag use <alias>を再実行してください"),
+            "reauthentication_required": T("sign-in needs renewal; run mag login codex <alias>, then mag use <alias>", "再ログインが必要です。mag login codex <alias>の後、mag use <alias>を実行してください"),
+            "failed": T("authentication monitor could not start; retry mag use <alias>", "認証の常駐監視を起動できません。mag use <alias>を再実行してください"),
+        }
+        text = texts.get(status, T("authentication application unconfirmed", "認証の反映を確認できません"))
+    print("  Codex: " + text)
 
 
 def print_codex_switch_note(prov: str, name: str) -> None:
@@ -1192,6 +1720,31 @@ def find_account(slug: str) -> dict | None:
     return next((a for a in accounts() if a["slug"] == slug), None)
 
 
+# ── メインアカウント ─────────────────────────────────────────────────────
+# Artifact・会話履歴・定期実行など、アカウントに紐づいて残るものは、使った
+# アカウントごとに散らばる。provider ごとに 1 つ「メイン」を決めておき、
+# 予備に移っても使えるようになり次第メインへ戻す。メインの印はアカウントの
+# 登録情報に持たせる（改名・削除にそのまま追従させるため）。
+def main_slug(provider: str = "claude") -> str | None:
+    return next((a["slug"] for a in accounts_of(provider) if a.get("main")), None)
+
+
+def set_main(slug: str | None, provider: str) -> None:
+    accs = accounts()
+    for a in accs:
+        if provider_of(a) != provider:
+            continue
+        if a["slug"] == slug:
+            a["main"] = True
+        else:
+            a.pop("main", None)
+    save_accounts(accs)
+
+
+def main_mark(slug: str) -> str:
+    return T(" ★ main", " ★ メイン") if (find_account(slug) or {}).get("main") else ""
+
+
 # ── 表示名（alias）────────────────────────────────────────────────────────
 # slug は Keychain / state のキーとして内部でだけ使う。ユーザーが打つのも
 # 画面に出るのも label（alias）と、どのアカウントかを示すメールだけ。
@@ -1220,7 +1773,20 @@ def label_taken_by(label: str, accs: list, except_slug: str | None = None) -> di
                  if a["slug"] != except_slug and (a.get("label") or "").strip().lower() == n), None)
 
 
+# コマンドの一部として読む語。alias にすると `mag main clear` などと区別できない
+RESERVED_ALIASES = ("clear",)
+
+
+def alias_reserved_error(label: str) -> str | None:
+    if (label or "").strip().lower() in RESERVED_ALIASES:
+        return T(f"'{label}' is reserved by magazine — pick another alias",
+                 f"'{label}' は magazine が予約している語なので alias にできません — 別名にしてください")
+    return None
+
+
 def label_conflict_error(label: str, accs: list, except_slug: str | None = None) -> str | None:
+    if err := alias_reserved_error(label):
+        return err
     other = label_taken_by(label, accs, except_slug)
     if not other:
         return None
@@ -1293,7 +1859,8 @@ def reconcile_current() -> dict:
     """
     fixed = {}
     sync_live_credentials()   # rotation で保管庫が古びるのを先に埋める
-    live = (current_oauth() or {}).get("refreshToken")
+    # 中継中は本体のログインが常にメインなので、そこから「使っている枠」は分からない
+    live = None if relay_enabled() else (current_oauth() or {}).get("refreshToken")
     if live:
         for a in accounts_of("claude"):
             st = stored_oauth(a["slug"]) or {}
@@ -1321,7 +1888,10 @@ def cooldown_left(slug: str, s: dict = None) -> float:
 
 def set_cooldown(slug: str, kind: str | None, resets_at: float | None) -> None:
     cfg = config()
-    kind = kind or "five_hour"
+    # Claude のサブスクには 5 時間枠がもう無い（usage API の five_hour は null）。
+    # どの枠に当たったか分からないときは「不明」として扱い、5 時間後に見直す
+    # （週次と決めつけて 7 日間外すより、早めに再確認する方が損が小さい）。
+    kind = kind or "unknown"
     if not resets_at:
         span = cfg.get(f"fallback_cooldown_{kind}") or cfg["fallback_cooldown_five_hour"]
         resets_at = now() + span
@@ -1355,7 +1925,7 @@ def probe(slug: str, quiet: bool = True) -> dict:
     oauth = stored_oauth(slug)
     # 現用の弾は「現用スロットの実物」で見る。本体がトークンを更新した直後は
     # 保管庫のコピーが古いままになるが、それは弾が死んだという意味ではない。
-    if get_current("claude") == slug:
+    if (main_slug("claude") if relay_enabled() else get_current("claude")) == slug:
         live = current_oauth()
         if live and live.get("accessToken"):
             oauth = live
@@ -1422,6 +1992,14 @@ def is_usable(slug: str, p: dict = None) -> tuple[bool, str]:
 
 
 def do_load(slug: str, reason: str = "") -> bool:
+    if provider_of(find_account(slug) or {}) == "codex":
+        with codex_auth_lock():
+            ok = _do_load(slug, reason)
+        return codex_apply_selection() if ok else False
+    return _do_load(slug, reason)
+
+
+def _do_load(slug: str, reason: str = "") -> bool:
     acct = find_account(slug) or {}
     prov = provider_of(acct) if acct else "claude"
     name = display(acct) if acct else slug
@@ -1472,7 +2050,15 @@ def do_load(slug: str, reason: str = "") -> bool:
         sync_live_credentials()
         oauth = ensure_fresh(slug, oauth)
         try:
-            install_oauth(oauth)
+            if relay_enabled():
+                # 中継中は本体のログイン（メイン）を動かさない。使う枠だけを切り替え、
+                # 次の会話リクエストから中継がこのアカウントの認証で送る。
+                exp = oauth.get("expiresAt")
+                if exp and (exp / 1000.0) <= now():
+                    raise RuntimeError(T("the stored credential has expired; sign in again",
+                                         "保管している認証情報が期限切れです。入れ直してください"))
+            else:
+                install_oauth(oauth)
         except RuntimeError as e:
             print(T(f"✗ failed to activate {name}: {e}", f"✗ {name} への切り替えに失敗: {e}"), file=sys.stderr)
             log(f"load failed: {slug}: {e}")
@@ -1492,9 +2078,14 @@ def next_slug(after: str | None, probe_all: bool = True,
         return None, []
     slugs = [a["slug"] for a in accs]
     start = slugs.index(after) if after in slugs else -1
+    order = [slugs[(start + i) % len(slugs)] for i in range(1, len(slugs) + 1)]
+    # メインが使えるなら、順番に関係なくメインへ戻す（散らばりを最小にする）
+    main = main_slug(provider)
+    if main and main != after:
+        order.remove(main)
+        order.insert(0, main)
     report = []
-    for i in range(1, len(slugs) + 1):
-        cand = slugs[(start + i) % len(slugs)]
+    for cand in order:
         if cooldown_left(cand) > 0:
             cd = state()["cooldowns"][cand]
             report.append((cand, T(f"spent, metered also capped → {fmt_when(cd['until'])}",
@@ -1509,6 +2100,31 @@ def next_slug(after: str | None, probe_all: bool = True,
         if ok:
             return cand, report
     return None, report
+
+
+def main_ready(provider: str = "claude", probe_main: bool = True) -> tuple[str | None, str]:
+    """予備を使っている間に、メインへ戻ってよい状態になったか。
+
+    戻すのは「自動で予備に移った」ときだけ。`mag use` で選んだアカウントは
+    本人の意思なので、メインが空いてもそのままにする。戻した直後に上限で
+    また離れる往復を避けるため、メインの使用率は監視の切替閾値より下を求める。
+    """
+    main, cur = main_slug(provider), get_current(provider)
+    if not main or not cur or cur == main:
+        return None, "not applicable"
+    if manually_selected(cur, provider):
+        return None, "manual selection"
+    if cooldown_left(main) > 0:
+        return None, "main is limited"
+    p = probe(main) if (probe_main and provider == "claude") else None
+    if p is not None:
+        if not p.get("ok"):
+            return None, p.get("error") or "usage unknown"
+        _kind, pct = peak_window(p)
+        if pct is not None and pct >= config()["hotswap_threshold"]:
+            return None, f"main at {pct:.0f}%"
+    ok, why = is_usable(main, p)
+    return (main, "ok") if ok else (None, why)
 
 
 def has_spare(except_slug: str | None, provider: str = "claude") -> bool:
@@ -1699,7 +2315,7 @@ def isolated_login(prov: str) -> tuple[dict | None, dict | None, str | None]:
     try:
         if prov == "codex":
             env["CODEX_HOME"] = home
-            src_cfg = os.path.expanduser("~/.codex/config.toml")
+            src_cfg = os.path.join(os.path.dirname(CODEX_AUTH_PATH), "config.toml")
             if os.path.exists(src_cfg):
                 try:
                     _sh.copy(src_cfg, os.path.join(home, "config.toml"))
@@ -1729,6 +2345,9 @@ def cmd_login(args) -> int:
     prov, alias = args.provider, args.alias.strip()
     if not alias:
         print(T("✗ alias is empty", "✗ alias が空です"), file=sys.stderr)
+        return 1
+    if err := alias_reserved_error(alias):
+        print(f"✗ {err}", file=sys.stderr)
         return 1
     taken = label_taken_by(alias, accounts())
     # provider が違えば同じメールでも別エントリになるため、ログイン後に
@@ -1845,6 +2464,185 @@ def cmd_rename(args) -> int:
     return 0
 
 
+def cmd_main(args) -> int:
+    """メインアカウントを指定・表示・解除する（provider ごとに 1 つ）。"""
+    clear = getattr(args, "clear", None)
+    target = getattr(args, "provider", None)
+    if (args.name or "").strip().lower() == "clear":
+        clear = target or "all"
+    elif target:
+        print(T("✗ a provider is only taken after `clear`: `mag main clear [claude|codex]`",
+                "✗ claude / codex を付けるのは解除のときだけです: `mag main clear [claude|codex]`"), file=sys.stderr)
+        return 1
+    if clear:
+        provs = ("claude", "codex") if clear == "all" else (clear,)
+        for prov in provs:
+            if prov == "claude" and (relay_enabled() or relay_settings_installed()):
+                if relay_turn_off() != 0:          # 中継はメインが前提。先に止めて設定を戻す
+                    return 1
+            had = main_slug(prov)
+            set_main(None, prov)
+            if had or clear != "all":
+                print(T(f"✓ {prov}: no main account", f"✓ {prov}: メインアカウントを解除しました"))
+        return 0
+    if not args.name:
+        shown = False
+        for prov, title in (("claude", "Claude Code"), ("codex", "Codex / ChatGPT")):
+            if not accounts_of(prov):
+                continue
+            shown = True
+            main = main_slug(prov)
+            print(f"{title}: " + (describe(find_account(main)) if main
+                                  else T("(not set — `mag main ALIAS`)", "(未設定 — `mag main ALIAS` で指定)")))
+        if not shown:
+            print(T("No accounts registered. Add one with `mag add`.",
+                    "アカウントが未登録です。`mag add` で登録してください。"))
+            return 1
+        return 0
+    acct, err = resolve_account(args.name)
+    if not acct:
+        print(f"✗ {err}", file=sys.stderr)
+        return 1
+    prov = provider_of(acct)
+    set_main(acct["slug"], prov)
+    print(T(f"★ main {prov} account: {describe(acct)}", f"★ {prov} のメインアカウント: {describe(acct)}"))
+    if prov == "claude" and not IS_WINDOWS:
+        # メインを決めたら中継も ON: ログインはメインに固定し、切り替えるのは利用枠だけにする
+        if relay_turn_on() != 0:
+            print(T("  The main account is set, but switching still replaces the Claude Code login."
+                    " Fix the problem above and run `mag relay on`.",
+                    "  メインは設定しましたが、切り替えは従来どおり Claude Code のログインを入れ替えます。"
+                    "上の問題を直して `mag relay on` を実行してください。"), file=sys.stderr)
+            return 1
+        print(T("  When a spare's usage is in use, magazine moves back to this account's usage as soon as it is usable"
+                " (`mag watch` checks every few minutes; a `mag use` choice is left alone).",
+                "  予備の利用枠を使っていても、メインの枠が使えるようになり次第こちらへ戻します"
+                "（`mag watch` が数分おきに確認。`mag use` で選んだアカウントはそのまま）。"))
+        return 0
+    print(T("  When a spare is in use, magazine switches back here as soon as this account is usable again "
+            "(`mag watch` checks every few minutes; a `mag use` choice is left alone).",
+            "  予備に移っても、ここが使えるようになり次第こちらへ戻します"
+            "（`mag watch` が数分おきに確認。`mag use` で選んだアカウントはそのまま）。"))
+    if get_current(prov) != acct["slug"]:
+        print(T(f"  Active now: {label_of(get_current(prov))}. Switch now with `mag use {display(acct)}`.",
+                f"  いま使用中: {label_of(get_current(prov))}。すぐ切り替えるなら `mag use {display(acct)}`。"))
+    return 0
+
+
+def cmd_relay(args) -> int:
+    """利用枠だけを予備へ回す中継の on / off / status / serve。"""
+    action = args.action or "status"
+    if action == "serve":
+        if not relay_enabled():
+            print(T("relay is off — `mag relay on` first", "中継は無効です。先に `mag relay on`"), file=sys.stderr)
+            return 1
+        srv = RelayServer(relay_port())
+        srv.start()
+        print(T(f"relay listening on {relay_url()} (Ctrl-C to stop)", f"中継: {relay_url()} で待ち受け中（Ctrl-C で停止）"))
+        try:
+            while srv.alive():
+                time.sleep(1)
+        except KeyboardInterrupt:
+            srv.stop()
+        return 0
+
+    if action == "on":
+        return relay_turn_on()
+
+    if action == "off":
+        return relay_turn_off()
+
+    # status
+    on = relay_enabled()
+    print(T(f"relay: {'on' if on else 'off'}", f"中継: {'ON' if on else 'OFF'}"))
+    if on:
+        print(T(f"  login (Artifacts etc.): {label_of(main_slug('claude'))}   usage: {label_of(get_current('claude'))}",
+                f"  ログイン（Artifact など）: {label_of(main_slug('claude'))}   利用枠: {label_of(get_current('claude'))}"))
+        print(T(f"  listening: {'yes' if relay_listening() else 'NO — Claude Code cannot connect'} ({relay_url()})",
+                f"  待ち受け: {'OK' if relay_listening() else 'なし — Claude Code が接続できません'} ({relay_url()})"))
+        print(T(f"  Claude Code settings: {'ok' if relay_settings_installed() else 'missing — run `mag relay on`'}",
+                f"  Claude Code の設定: {'OK' if relay_settings_installed() else 'なし — `mag relay on` を再実行'}"))
+    elif main_slug("claude"):
+        print(T("  Switching replaces the Claude Code login. `mag relay on` keeps it on the main account.",
+                "  切り替えのたびに Claude Code のログインを入れ替えます。`mag relay on` でメインに固定できます。"))
+    return 0
+
+
+def relay_turn_on() -> int:
+    """中継を ON にする（何度呼んでもよい）。`mag main` からも呼ばれる。"""
+    if IS_WINDOWS:
+        print(T("✗ the relay is not supported on Windows yet", "✗ 中継は Windows ではまだ使えません"), file=sys.stderr)
+        return 1
+    main = main_slug("claude")
+    if not main:
+        print(T("✗ choose the main account first: `mag main ALIAS`",
+                "✗ 先にメインアカウントを決めてください: `mag main ALIAS`"), file=sys.stderr)
+        return 1
+    if conflict := relay_settings_conflict():
+        print(T(f"✗ another HTTPS proxy is already configured ({conflict}); the relay cannot be chained to it",
+                f"✗ 別の HTTPS プロキシが設定済みです（{conflict}）。中継はこれと併用できません"), file=sys.stderr)
+        return 1
+    try:
+        if not relay_certs_ready():
+            relay_make_certs()
+    except (RuntimeError, OSError) as e:
+        print(T(f"✗ could not create the relay certificate: {e}", f"✗ 中継用の証明書を作れません: {e}"), file=sys.stderr)
+        return 1
+    set_relay_enabled(True)        # 先に立てる: ログインを入れ替えても「使う枠」は動かさない
+    err = install_main_login()
+    if err:
+        set_relay_enabled(False)
+        print(T(f"✗ could not sign Claude Code in to the main account: {err}",
+                f"✗ Claude Code のログインをメインにできませんでした: {err}"), file=sys.stderr)
+        return 1
+    try:
+        relay_settings_apply(True)
+    except (RuntimeError, OSError) as e:
+        set_relay_enabled(False)
+        print(T(f"✗ could not update Claude Code settings: {e}", f"✗ Claude Code の設定を更新できません: {e}"),
+              file=sys.stderr)
+        return 1
+    print(T(f"✓ relay on: Claude Code stays signed in to {describe(find_account(main))};"
+            f" usage is charged to {label_of(get_current('claude'))}",
+            f"✓ 中継 ON: Claude Code のログインは {describe(find_account(main))} のまま、"
+            f"利用枠は {label_of(get_current('claude'))} から使います"))
+    print(T("  Artifacts, Remote Control and everything else stay on the main account.",
+            "  Artifact・Remote Control などはすべてメインに残ります。"))
+    if watch_daemon_state() != T("running", "稼働中"):
+        print(T("  ⚠ the relay runs inside `mag watch`. Start it (or enable the background service);"
+                " until then Claude Code cannot connect.",
+                "  ⚠ 中継は `mag watch` の中で動きます。起動してください（常駐サービス推奨）。"
+                "起動するまで Claude Code は接続できません。"))
+    else:
+        print(T("  The background monitor starts the relay within about 20 seconds.",
+                "  常駐監視が 20 秒ほどで中継を起動します。"))
+    print(T("  Restart Claude Code sessions that were already open; they keep using the main account's usage.",
+            "  開いていた Claude Code のセッションは再起動してください（再起動まではメインの枠を使います）。"))
+    return 0
+
+
+def relay_turn_off() -> int:
+    """中継を OFF にし、Claude Code の設定を元に戻す。"""
+    if not relay_enabled() and not relay_settings_installed():
+        print(T("relay is already off", "中継はすでに OFF です"))
+        return 0
+    try:
+        relay_settings_apply(False)
+    except (RuntimeError, OSError) as e:
+        print(T(f"✗ could not update Claude Code settings: {e}", f"✗ Claude Code の設定を更新できません: {e}"),
+              file=sys.stderr)
+        return 1
+    set_relay_enabled(False)
+    main = main_slug("claude")
+    if main:
+        set_current("claude", main)      # 本体のログイン＝メインが、そのまま使う枠になる
+    print(T("✓ relay off. Restart open Claude Code sessions so they stop using the relay.",
+            "✓ 中継 OFF。開いている Claude Code のセッションは再起動してください。"))
+    print(T("  Switching goes back to replacing the Claude Code login. `mag relay on` turns it back on.",
+            "  以後の切り替えは、これまで通り Claude Code のログインを入れ替えます。戻すときは `mag relay on`。"))
+    return 0
+
+
 def bar(pct) -> str:
     if pct is None:
         return "－－－－－－－－－－   ?"
@@ -1869,7 +2667,15 @@ def cmd_status(args) -> int:
         cur = get_current(prov)
         print(T(f"━━ {title} ━━  {len(accs)} account(s)   active: {label_of(cur) if cur else '(none)'}",
                 f"━━ {title} ━━  {len(accs)} 個   使用中: {label_of(cur) if cur else '(なし)'}"))
+        if prov == "claude" and relay_enabled():
+            ok = relay_listening()
+            print(T(f"   relay on: signed in as {label_of(main_slug('claude'))} (Artifacts etc.),"
+                    f" usage from ▶{'' if ok else '   ⚠ relay not listening'}",
+                    f"   中継 ON: ログインは {label_of(main_slug('claude'))}（Artifact など）、利用枠は ▶"
+                    f"{'' if ok else '   ⚠ 中継が待ち受けていません'}"))
         rc |= _print_magazine(accs, prov, args)
+        if prov == "codex":
+            print_codex_sync_status()
         print()
     return rc
 
@@ -1879,7 +2685,7 @@ def _print_magazine(accs: list, prov: str, args) -> int:
     for a in accs:
         slug = a["slug"]
         mark = "▶" if slug == cur else " "
-        line = f"{mark} {display(a)}  \033[2m{a.get('email') or ''}\033[0m"
+        line = f"{mark} {display(a)}{main_mark(slug)}  \033[2m{a.get('email') or ''}\033[0m"
         if args.quick or prov == "codex":
             left = cooldown_left(slug)
             extra = a.get("plan")
@@ -1904,7 +2710,10 @@ def _print_magazine(accs: list, prov: str, args) -> int:
         if not p["ok"]:
             print(f"    ? {p['error']}")
         else:
-            rows = [("5h", p["five_hour"] or {}), ("7d", p["seven_day"] or {})]
+            # 報告された枠だけ並べる。Claude のサブスクは 5 時間枠を返さなくなった
+            # （five_hour が null）ので、無い枠を「?」で並べると誤解を招く。
+            rows = [(k, p[key] or {}) for k, key in (("5h", "five_hour"), ("7d", "seven_day"))
+                    if (p[key] or {}).get("pct") is not None] or [("7d", {})]
             # モデル別の週次枠（Fable など）。全体枠とは別勘定なので同じゲージで並べる。
             rows += [(f"7d/{sc['model']}", sc) for sc in p.get("scoped") or []]
             width = max(4, max(len(k) for k, _ in rows) + 2)
@@ -2008,6 +2817,11 @@ def print_usage_timestamp(row: dict, indent: str = "      ") -> None:
     print(f"{indent}\033[2m{text}\033[0m")
 
 
+def is_five_hour_window(w: dict) -> bool:
+    """記録済みの枠が Claude の 5 時間枠か（旧記録は kind を持たないので表示名で見る）。"""
+    return w.get("kind") == "five_hour" or w.get("label") in ("5-hour", "5時間")
+
+
 def collect_limits(parallel_fetch: bool = True, args_ns=None) -> list:
     """全アカウントの残量を集めて、表示用の行に整える。"""
     rows = []
@@ -2032,13 +2846,14 @@ def collect_limits(parallel_fetch: bool = True, args_ns=None) -> list:
         slug = a["slug"]
         p = results.get(slug) or {}
         row = {"provider": "claude", "slug": slug, "label": a.get("label", slug),
-               "current": get_current("claude") == slug, "windows": [], "note": None,
+               "current": get_current("claude") == slug, "main": bool(a.get("main")),
+               "windows": [], "note": None,
                "cooldown": cooldown_left(slug)}
         if p.get("ok"):
             for key, label in (("five_hour", T("5-hour", "5時間")), ("seven_day", T("weekly", "週次"))):
                 blk = p.get(key) or {}
                 if blk.get("pct") is not None:
-                    row["windows"].append({"label": label, "pct": blk["pct"],
+                    row["windows"].append({"label": label, "pct": blk["pct"], "kind": key,
                                            "resets_at": blk.get("resets_at")})
             for sc in p.get("scoped") or []:
                 row["windows"].append({"label": T(f"weekly/{sc['model']}", f"週次/{sc['model']}"), "pct": sc["pct"],
@@ -2049,7 +2864,8 @@ def collect_limits(parallel_fetch: bool = True, args_ns=None) -> list:
             row["note"] = p.get("error") or T("unavailable", "取得不可")
             old = known_limits(slug)
             if old:
-                row["windows"] = old.get("windows") or []
+                # 5 時間枠が廃止される前の記録は、もう存在しない枠の数字なので出さない
+                row["windows"] = [w for w in old.get("windows") or [] if not is_five_hour_window(w)]
                 row["stale_ts"] = old.get("ts")
         rows.append(row)
 
@@ -2057,7 +2873,7 @@ def collect_limits(parallel_fetch: bool = True, args_ns=None) -> list:
         slug = a["slug"]
         is_cur = get_current("codex") == slug
         row = {"provider": "codex", "slug": slug, "label": a.get("label", slug),
-               "current": is_cur, "windows": [], "note": None,
+               "current": is_cur, "main": bool(a.get("main")), "windows": [], "note": None,
                "cooldown": cooldown_left(slug)}
         row.update(codex_usage_snapshot(slug, refresh=getattr(args_ns, "refresh", False)))
         rows.append(row)
@@ -2084,7 +2900,7 @@ def cmd_limits(args) -> int:
         print(f"\n\033[1m{titles[prov]}\033[0m")
         for r in group:
             mark = "\033[32m▶\033[0m" if r["current"] else " "
-            name = f"{r['label']}"
+            name = f"{r['label']}" + (main_mark(r["slug"]) if r.get("main") else "")
             head = f" {mark} {name}"
             if r["cooldown"] > 0:
                 cd = state()["cooldowns"][r["slug"]]
@@ -2158,16 +2974,44 @@ def resolve_account(needle: str) -> tuple[dict | None, str]:
 
 
 def cmd_load(args) -> int:
+    acct, _ = resolve_account(args.alias)
+    lock = codex_auth_lock() if acct and provider_of(acct) == "codex" else contextlib.nullcontext()
+    with lock:
+        return _cmd_load(args)
+
+
+def _cmd_load(args) -> int:
     acct, err = resolve_account(args.alias)
     if not acct:
         print(f"✗ {err}", file=sys.stderr)
         return 1
     prov = provider_of(acct)
-    if get_current(prov) == acct["slug"]:
+    restart_codex = getattr(args, "restart_codex", False)
+    if restart_codex and prov != "codex":
+        print(T("✗ --restart-codex requires a Codex account.",
+                "✗ --restart-codex は Codex アカウントにのみ指定できます。"), file=sys.stderr)
+        return 1
+    already_active = get_current(prov) == acct["slug"]
+    if prov == "codex" and already_active:
+        # State can lag a manual login. Confirm the disk account before
+        # treating a selection as already active.
+        live = codex_live_auth() or {}
+        stored = codex_stored_auth(acct["slug"]) or {}
+        live_id = (live.get("tokens") or {}).get("account_id")
+        stored_id = (stored.get("tokens") or {}).get("account_id")
+        live_at = parse_iso(live.get("last_refresh")) or 0
+        stored_at = parse_iso(stored.get("last_refresh")) or 0
+        # A fresh `mag login` can renew this same account in the vault while
+        # the file still contains the revoked login. Install that newer login.
+        already_active = bool(live_id and stored_id and live_id == stored_id and live_at >= stored_at)
+    if already_active:
         set_current(prov, acct["slug"], manual=True)
         print(T(f"= already active: {describe(acct)}", f"= すでに使用中: {describe(acct)}"))
         print(T("  Manual selection: automatic switching waits for 100% usage.",
                 "  手動選択を優先: 使用率100%になるまで自動切替しません。"))
+        if prov == "codex":
+            return 0 if codex_apply_selection() else 1
+        print_codex_switch_note(prov, display(acct))
         return 0
     if not do_load(acct["slug"], "manual"):
         return 1
@@ -2214,14 +3058,23 @@ def cmd_auto(args) -> int:
     if not accounts_of(prov):
         return 0  # 未設定なら何もしない（通常の起動を邪魔しない）
     cur = get_current(prov)
+    # 予備で動いていてメインが空いたら戻す。--no-probe（起動前フックの既定）では
+    # メインの残量を確かめられないので、戻すのは常駐監視に任せる。
+    if not args.no_probe:
+        main, _why = main_ready(prov)
+        if main and do_load(main, "return to main"):
+            print(T(f"[magazine] back to main: {label_of(main)}",
+                    f"[magazine] メインに戻しました: {label_of(main)}"))
+            return 0
     if cur and cooldown_left(cur) == 0:
         p = probe(cur) if (not args.no_probe and prov == "claude") else None
         ok, why = is_usable(cur, p)
         if ok:
             if args.verbose:
-                pct = ((p or {}).get("five_hour") or {}).get("pct")
-                print(T(f"[magazine] {label_of(cur)}: 5h {pct if pct is not None else '?'}% — keeping",
-                      f"[magazine] {label_of(cur)}: 5h {pct if pct is not None else '?'}% — そのまま"))
+                kind, pct = peak_window(p)
+                shown = f"{WINDOW_LABEL.get(kind, kind)} {pct:.0f}%" if pct is not None else "?"
+                print(T(f"[magazine] {label_of(cur)}: {shown} — keeping",
+                      f"[magazine] {label_of(cur)}: {shown} — そのまま"))
             return 0
         print(T(f"[magazine] {label_of(cur)} is out ({why})", f"[magazine] {label_of(cur)} 上限到達 ({why})"))
     rc = cmd_next(argparse.Namespace(no_probe=args.no_probe, provider=prov))
@@ -2260,8 +3113,9 @@ def cmd_hit(args) -> int:
             kind = kind or cand[0][1]
             resets = cand[0][2]
     set_cooldown(cur, kind, resets)
-    print(T(f"⛔ marked as limited: {label_of(cur)} ({kind or 'five_hour'})",
-            f"⛔ 上限到達として記録: {label_of(cur)} ({kind or 'five_hour'})"))
+    kind = (state().get("cooldowns") or {}).get(cur, {}).get("kind") or kind
+    print(T(f"⛔ marked as limited: {label_of(cur)} ({kind})",
+            f"⛔ 上限到達として記録: {label_of(cur)} ({kind})"))
     return cmd_next(argparse.Namespace(no_probe=False))
 
 
@@ -2640,8 +3494,13 @@ def live_worst(max_age: float = 120.0) -> dict | None:
     return worst
 
 
-def live_five_hour_pct(max_age: float = 120.0) -> float | None:
-    """現用アカウントの直近 5h 使用率（稼働中セッションの statusLine 由来）。"""
+def live_peak_pct(max_age: float = 120.0) -> float | None:
+    """現用アカウントの直近の使用率（報告された枠のうち最も高いもの。statusLine 由来）。
+
+    以前は 5 時間枠だけを見ていたが、Claude のサブスクは 5 時間枠を返さなくなった。
+    5 時間枠だけを見続けると、週次が上限に近づいても監視間隔が縮まらず、
+    次のアカウントの事前確認も走らない。
+    """
     if not os.path.isdir(LIVE_DIR):
         return None
     cur = get_current("claude")
@@ -2654,9 +3513,10 @@ def live_five_hour_pct(max_age: float = 120.0) -> float | None:
             continue
         if cur and d.get("slug") and d["slug"] != cur:
             continue
-        pct = (d.get("five_hour") or {}).get("pct")
-        if pct is not None and (best is None or pct > best):
-            best = pct
+        for k in ("five_hour", "seven_day"):
+            pct = (d.get(k) or {}).get("pct")
+            if pct is not None and (best is None or pct > best):
+                best = pct
     return best
 
 
@@ -2688,7 +3548,7 @@ def warm_account(slug: str) -> tuple[bool, str]:
     CLAUDE_CODE_OAUTH_TOKEN を使い、現用 Keychain スロットには一切触れない
     （＝今動いている稼働中セッションに影響しない）。狙いは2つ:
       - 認証切れ・失効などを実際に使う前に検出する
-      - 5h ウィンドウが未使用なら、軽く動かして起動しておく
+      - 凍結・プラン解約など、残量 API には出ない理由で使えないことを先に知る
     """
     oauth = stored_oauth(slug)
     if not oauth:
@@ -2744,6 +3604,623 @@ def hotswap(kind: str, reason: str, resets_at=None) -> bool:
     return True
 
 
+# ── 中継（relay）: 利用枠だけを予備アカウントへ ─────────────────────────
+# Keychain は常にメインのまま置き、Claude Code の会話リクエスト
+# （POST /v1/messages）の認証だけを、いま枠を使っている予備のものへ差し替える。
+# Artifact・Remote Control・プラグインなど、それ以外の通信は本体のログイン
+# （＝メイン）のまま通るので、アカウントに残るものはメインに集まる。
+#
+# 仕組み: Claude Code に HTTPS_PROXY でこの中継を使わせる。api.anthropic.com
+# への接続だけは、名前制約付きのローカル CA（api.anthropic.com 以外には使えない）
+# で TLS を受けて中身を見る。CA は NODE_EXTRA_CA_CERTS で Claude Code だけに信頼させる。
+# 設定の環境変数は Claude Code が起動するコマンドにも引き継がれるので、
+# 接続元が Claude Code 本体のときだけ開き、それ以外（curl・Python など）は
+# 中身を見ずにトンネルする。ANTHROPIC_BASE_URL を使わないのは、使うと
+# Claude Code が Remote Control などを無効にするため（実測）。
+RELAY_DIR = os.path.join(ROOT, "relay")
+RELAY_HOST = "api.anthropic.com"
+RELAY_SWAP_PREFIX = "/v1/messages"
+RELAY_NO_PROXY = ("localhost", "127.0.0.1", "::1")
+
+
+def relay_port() -> int:
+    return int(config().get("relay_port") or 47821)
+
+
+def relay_url() -> str:
+    return f"http://127.0.0.1:{relay_port()}"
+
+
+def relay_state() -> dict:
+    return state().get("relay") or {}
+
+
+def relay_enabled() -> bool:
+    return bool(relay_state().get("enabled"))
+
+
+def relay_ca_path() -> str:
+    return os.path.join(RELAY_DIR, "ca.pem")
+
+
+def _openssl() -> str | None:
+    return shutil.which("openssl")
+
+
+def relay_certs_ready() -> bool:
+    return all(os.path.exists(os.path.join(RELAY_DIR, f)) for f in ("ca.pem", "leaf.pem", "leaf.key"))
+
+
+def relay_make_certs() -> None:
+    """api.anthropic.com 専用のローカル CA とサーバー証明書を作る。
+
+    CA には名前制約を付け、api.anthropic.com 以外の証明書には使えないようにする。
+    署名が済んだら CA の秘密鍵は消す（この CA で新しい証明書を作れる者を残さない）。
+    どちらも 10 年有効。作り直すと動いているセッションが新しい CA を知らないので、
+    期限前に作り直すことはしない。
+    """
+    ssl_bin = _openssl()
+    if not ssl_bin:
+        raise RuntimeError(T("openssl command not found", "openssl コマンドが見つかりません"))
+    os.makedirs(RELAY_DIR, exist_ok=True)
+    harden_path(RELAY_DIR, 0o700)
+    work = os.path.join(RELAY_DIR, f".new-{os.getpid()}")
+    os.makedirs(work, exist_ok=True)
+    try:
+        def run(*cmd):
+            r = subprocess.run([ssl_bin, *cmd], cwd=work, capture_output=True, text=True)
+            if r.returncode != 0:
+                raise RuntimeError(f"openssl {cmd[0]}: {(r.stderr or r.stdout).strip()[-200:]}")
+
+        run("req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", "ca.key", "-out", "ca.pem",
+            "-days", "3650", "-subj", "/CN=magazine relay (api.anthropic.com only)",
+            "-addext", "basicConstraints=critical,CA:TRUE,pathlen:0",
+            "-addext", "keyUsage=critical,keyCertSign,cRLSign",
+            "-addext", f"nameConstraints=critical,permitted;DNS:{RELAY_HOST}")
+        run("req", "-newkey", "rsa:2048", "-nodes", "-keyout", "leaf.key", "-out", "leaf.csr",
+            "-subj", f"/CN={RELAY_HOST}")
+        with open(os.path.join(work, "leaf.ext"), "w") as f:
+            f.write(f"subjectAltName=DNS:{RELAY_HOST}\nbasicConstraints=critical,CA:FALSE\n"
+                    "keyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n")
+        run("x509", "-req", "-in", "leaf.csr", "-CA", "ca.pem", "-CAkey", "ca.key", "-CAcreateserial",
+            "-out", "leaf.pem", "-days", "3650", "-extfile", "leaf.ext")
+        for name in ("leaf.key",):
+            harden_path(os.path.join(work, name), 0o600)
+        for name in ("ca.pem", "leaf.pem", "leaf.key"):
+            os.replace(os.path.join(work, name), os.path.join(RELAY_DIR, name))
+    finally:
+        shutil.rmtree(work, ignore_errors=True)   # ca.key もここで消える
+    log("relay: 証明書を作成しました")
+
+
+# ── 接続元が Claude Code 本体か ──
+def _peer_pid(client_port: int) -> int | None:
+    """127.0.0.1:client_port から中継へ繋いできたプロセスの PID。"""
+    me = os.getpid()
+    if sys.platform.startswith("linux"):
+        want = f":{client_port:04X}"
+        inode = None
+        for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+            try:
+                with open(table) as f:
+                    next(f, None)
+                    for line in f:
+                        cols = line.split()
+                        if len(cols) > 9 and cols[1].endswith(want) and cols[3] == "01":
+                            inode = cols[9]
+                            break
+            except OSError:
+                continue
+            if inode:
+                break
+        if not inode:
+            return None
+        target = f"socket:[{inode}]"
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit() or int(pid) == me:
+                continue
+            fd_dir = f"/proc/{pid}/fd"
+            try:
+                for fd in os.listdir(fd_dir):
+                    if os.readlink(os.path.join(fd_dir, fd)) == target:
+                        return int(pid)
+            except OSError:
+                continue
+        return None
+    try:
+        out = subprocess.run(["lsof", "-nP", f"-iTCP@127.0.0.1:{client_port}", "-sTCP:ESTABLISHED", "-Fp"],
+                             capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    for line in out.splitlines():
+        if line.startswith("p") and line[1:].isdigit() and int(line[1:]) != me:
+            return int(line[1:])
+    return None
+
+
+def _pid_command(pid: int) -> str:
+    if sys.platform.startswith("linux"):
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                return f.read().replace(b"\0", b" ").decode(errors="replace")
+        except OSError:
+            return ""
+    try:
+        return subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
+                              capture_output=True, text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def is_claude_command(cmd: str) -> bool:
+    """コマンドラインが Claude Code 本体か（ネイティブ版・npm 版の両方）。"""
+    if not cmd:
+        return False
+    exe = os.path.basename(cmd.split()[0])
+    return (exe == "claude" or "/claude/versions/" in cmd
+            or "@anthropic-ai/claude-code" in cmd or "/claude-code/cli.js" in cmd)
+
+
+def relay_peer_is_claude(client_port: int) -> bool:
+    pid = _peer_pid(client_port)
+    return bool(pid) and is_claude_command(_pid_command(pid))
+
+
+# ── 差し替えの判断 ──
+class RelayAuth:
+    """会話リクエストの認証を、どのトークンに差し替えるか決める。
+
+    差し替えるのは、届いた認証が Keychain のログイン（メイン）そのものの時だけ。
+    別のトークン（事前確認用の CLAUDE_CODE_OAUTH_TOKEN など）は、送り主が
+    わざわざ選んだものなので触らない。
+    """
+
+    LIVE_RECHECK = 1.0
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._live = (None, 0.0)          # (accessToken, 読んだ時刻)
+        self._tokens = {}                 # slug -> (accessToken, 期限)
+        self._warned = {}
+
+    def _is_live(self, token: str) -> bool:
+        with self._lock:
+            live, at = self._live
+        if token == live:
+            return True
+        if now() - at < self.LIVE_RECHECK:
+            return False
+        live = (current_oauth() or {}).get("accessToken")
+        with self._lock:
+            self._live = (live, now())
+        return token == live
+
+    def token_for(self, slug: str) -> str | None:
+        with self._lock:
+            hit = self._tokens.get(slug)
+        if hit and hit[1] - now() > 120:
+            return hit[0]
+        oauth = stored_oauth(slug)
+        if not oauth:
+            return None
+        oauth = ensure_fresh(slug, oauth)
+        exp = (oauth.get("expiresAt") or 0) / 1000.0
+        if not oauth.get("accessToken") or (exp and exp <= now()):
+            return None
+        with self._lock:
+            self._tokens[slug] = (oauth["accessToken"], exp or now() + 300)
+        return oauth["accessToken"]
+
+    def replacement(self, bearer: str | None) -> str | None:
+        """差し替え先のトークン。差し替えないなら None。"""
+        if not bearer or not relay_enabled():
+            return None
+        cur, main = get_current("claude"), main_slug("claude")
+        if not cur or not main or cur == main:
+            return None
+        if not self._is_live(bearer):
+            return None
+        try:
+            tok = self.token_for(cur)
+        except Exception as e:   # 予備が使えないときは、止めずにメインのまま通す
+            tok, err = None, e
+        else:
+            err = None
+        if not tok:
+            if now() - self._warned.get(cur, 0) > 3600:
+                self._warned[cur] = now()
+                log(f"relay: {cur} の認証を用意できず、メインのまま通しました ({err or 'no token'})")
+                notify("🔫 claude-magazine",
+                       f"{label_of(cur)} の認証が使えないため、メインの枠で送信しています")
+            return None
+        return tok
+
+
+def rewrite_request_head(head: bytes, auth: RelayAuth) -> tuple[bytes, dict, bool]:
+    """リクエストの頭（リクエスト行＋ヘッダー）を必要なら書き換える。
+
+    返り値: (送る頭, 小文字ヘッダー辞書, 差し替えたか)
+    """
+    text = head.decode("latin-1")
+    lines = text.split("\r\n")
+    parts = lines[0].split(" ")
+    method, path = (parts + ["", ""])[:2]
+    hdr = {}
+    for ln in lines[1:]:
+        if ":" in ln:
+            k, v = ln.split(":", 1)
+            hdr[k.strip().lower()] = v.strip()
+    swapped = False
+    if method == "POST" and path.startswith(RELAY_SWAP_PREFIX):
+        bearer = hdr.get("authorization", "")
+        bearer = bearer[7:] if bearer.lower().startswith("bearer ") else None
+        new = auth.replacement(bearer)
+        if new:
+            for i, ln in enumerate(lines):
+                if i and ln.lower().startswith("authorization:"):
+                    lines[i] = f"Authorization: Bearer {new}"
+                    swapped = True
+            head = "\r\n".join(lines).encode("latin-1")
+    return head, hdr, swapped
+
+
+# ── 中継の配線 ──
+def _recv_head(sock, buf: bytes, limit: int = 256 * 1024) -> tuple[bytes | None, bytes]:
+    while b"\r\n\r\n" not in buf:
+        if len(buf) > limit:
+            raise ValueError("request head too large")
+        chunk = sock.recv(65536)
+        if not chunk:
+            return None, buf
+        buf += chunk
+    i = buf.index(b"\r\n\r\n") + 4
+    return buf[:i], buf[i:]
+
+
+def _pipe(src, dst) -> None:
+    try:
+        while True:
+            data = src.recv(65536)
+            if not data:
+                break
+            dst.sendall(data)
+    except (OSError, ValueError):
+        pass
+    finally:
+        for s in (src, dst):
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+
+def _send_body_exact(src, dst, buf: bytes, n: int) -> bytes:
+    head = buf[:n]
+    dst.sendall(head)
+    n -= len(head)
+    buf = buf[len(head):]
+    while n > 0:
+        data = src.recv(min(65536, n))
+        if not data:
+            raise EOFError
+        dst.sendall(data)
+        n -= len(data)
+    return buf
+
+
+def _send_body_chunked(src, dst, buf: bytes) -> bytes:
+    def line():
+        nonlocal buf
+        while b"\r\n" not in buf:
+            data = src.recv(65536)
+            if not data:
+                raise EOFError
+            buf += data
+        ln, buf = buf.split(b"\r\n", 1)
+        dst.sendall(ln + b"\r\n")
+        return ln
+
+    while True:
+        size = int(line().split(b";")[0].strip() or b"0", 16)
+        if size == 0:
+            while line():       # トレーラーを空行まで
+                pass
+            return buf
+        buf = _send_body_exact(src, dst, buf, size + 2)
+
+
+def relay_forward_requests(client, upstream, auth: RelayAuth, buf: bytes = b"") -> None:
+    """クライアント→上流の向きを、リクエスト単位で読みながら流す。
+
+    上流→クライアントは中身を変えないので、別スレッドでそのまま流す。
+    こちら向きだけリクエストの区切りを追い、頭だけ書き換える。
+    """
+    while True:
+        head, buf = _recv_head(client, buf)
+        if head is None:
+            return
+        head, hdr, _swapped = rewrite_request_head(head, auth)
+        upstream.sendall(head)
+        if "upgrade" in hdr.get("connection", "").lower():
+            if buf:
+                upstream.sendall(buf)
+            _pipe(client, upstream)
+            return
+        if "chunked" in hdr.get("transfer-encoding", "").lower():
+            buf = _send_body_chunked(client, upstream, buf)
+        elif hdr.get("content-length"):
+            buf = _send_body_exact(client, upstream, buf, int(hdr["content-length"]))
+
+
+class RelayServer:
+    def __init__(self, port: int, auth: RelayAuth | None = None):
+        self.port = port
+        self.auth = auth or RelayAuth()
+        self.sock = None
+        self.thread = None
+        self._server_ctx = None
+
+    def server_ctx(self):
+        if self._server_ctx is None:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(os.path.join(RELAY_DIR, "leaf.pem"), os.path.join(RELAY_DIR, "leaf.key"))
+            ctx.set_alpn_protocols(["http/1.1"])
+            self._server_ctx = ctx
+        return self._server_ctx
+
+    def start(self) -> None:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("127.0.0.1", self.port))
+        s.listen(128)
+        self.sock = s
+        self.server_ctx()        # 証明書の不備はここで分かるようにする
+        self.thread = threading.Thread(target=self._accept_loop, name="mag-relay", daemon=True)
+        self.thread.start()
+        log(f"relay: 127.0.0.1:{self.port} で待ち受け開始")
+
+    def stop(self) -> None:
+        if self.sock:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+        self.sock = None
+
+    def alive(self) -> bool:
+        return bool(self.sock and self.thread and self.thread.is_alive())
+
+    def _accept_loop(self) -> None:
+        while self.sock:
+            try:
+                c, addr = self.sock.accept()
+            except OSError:
+                break
+            threading.Thread(target=self._handle, args=(c, addr), daemon=True).start()
+
+    def _handle(self, client, addr) -> None:
+        try:
+            client.settimeout(30)
+            head, rest = _recv_head(client, b"")
+            if not head:
+                client.close()
+                return
+            parts = head.split(b"\r\n", 1)[0].decode("latin-1").split(" ")
+            if len(parts) < 2 or parts[0] != "CONNECT":
+                client.sendall(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                client.close()
+                return
+            host, _, port = parts[1].rpartition(":")
+            host, port = host.strip("[]"), int(port or 443)
+            try:
+                upstream = socket.create_connection((host, port), timeout=30)
+            except OSError:
+                client.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                client.close()
+                return
+            client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            client.settimeout(None)
+            upstream.settimeout(None)
+            if host == RELAY_HOST and port == 443 and relay_enabled() and relay_peer_is_claude(addr[1]):
+                self._intercept(client, upstream, rest)
+            else:
+                if rest:
+                    upstream.sendall(rest)
+                back = threading.Thread(target=_pipe, args=(upstream, client), daemon=True)
+                back.start()
+                _pipe(client, upstream)
+                back.join(30)
+                for sock_ in (client, upstream):
+                    try:
+                        sock_.close()
+                    except OSError:
+                        pass
+        except Exception as e:
+            log(f"relay: 接続処理エラー: {type(e).__name__}: {e}")
+            try:
+                client.close()
+            except OSError:
+                pass
+
+    def _intercept(self, client, upstream_raw, rest: bytes) -> None:
+        tls_client = tls_up = None
+        try:
+            if rest:
+                # TLS が始まる前にデータが来ることはない（CONNECT の応答待ちのはず）
+                raise ValueError("unexpected bytes before TLS")
+            tls_client = self.server_ctx().wrap_socket(client, server_side=True)
+            up_ctx = ssl.create_default_context()
+            up_ctx.set_alpn_protocols(["http/1.1"])
+            tls_up = up_ctx.wrap_socket(upstream_raw, server_hostname=RELAY_HOST)
+            threading.Thread(target=_pipe, args=(tls_up, tls_client), daemon=True).start()
+            relay_forward_requests(tls_client, tls_up, self.auth)
+        except (OSError, EOFError, ValueError, ssl.SSLError):
+            pass
+        finally:
+            for s in (tls_client, tls_up, client, upstream_raw):
+                if s is not None:
+                    try:
+                        s.close()
+                    except OSError:
+                        pass
+
+
+_RELAY_SERVER: RelayServer | None = None
+_RELAY_FAIL_AT = 0.0
+
+
+def relay_supervise() -> None:
+    """mag watch の周回ごとに呼ぶ。有効なら中継を動かし、無効なら止める。"""
+    global _RELAY_SERVER, _RELAY_FAIL_AT
+    want = relay_enabled()
+    if want and not (_RELAY_SERVER and _RELAY_SERVER.alive()):
+        if now() - _RELAY_FAIL_AT < 60:
+            return
+        try:
+            srv = RelayServer(relay_port())
+            srv.start()
+            _RELAY_SERVER = srv
+        except Exception as e:
+            _RELAY_FAIL_AT = now()
+            log(f"relay: 起動できません: {e}")
+            notify("🔫 claude-magazine", f"中継を起動できません（Claude Code が繋がりません）: {e}")
+    elif not want and _RELAY_SERVER:
+        _RELAY_SERVER.stop()
+        _RELAY_SERVER = None
+        log("relay: 停止しました")
+
+
+def relay_listening(timeout: float = 1.0) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", relay_port()), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+# ── Claude Code の設定（settings.json の env） ──
+def _claude_settings_path() -> str:
+    return os.path.join(claude_config_dir(), "settings.json")
+
+
+def relay_env_values(existing_env: dict) -> dict:
+    """settings.json の env に入れる値。既存の NO_PROXY・追加 CA は残して足す。"""
+    no_proxy = [p.strip() for p in str(existing_env.get("NO_PROXY") or os.environ.get("NO_PROXY") or "").split(",")
+                if p.strip()]
+    for h in RELAY_NO_PROXY:
+        if h not in no_proxy:
+            no_proxy.append(h)
+    ca = relay_ca_path()
+    prev_ca = existing_env.get("NODE_EXTRA_CA_CERTS") or os.environ.get("NODE_EXTRA_CA_CERTS")
+    if prev_ca and os.path.abspath(prev_ca) not in (ca, os.path.join(RELAY_DIR, "ca-bundle.pem")):
+        # 会社の CA などを既に足している場合は、それと合わせた束を作る
+        bundle = os.path.join(RELAY_DIR, "ca-bundle.pem")
+        with open(prev_ca, encoding="utf-8") as a, open(ca, encoding="utf-8") as b, \
+                open(bundle, "w", encoding="utf-8") as out:
+            out.write(a.read().rstrip() + "\n" + b.read())
+        ca = bundle
+    return {"HTTPS_PROXY": relay_url(), "NODE_EXTRA_CA_CERTS": ca, "NO_PROXY": ",".join(no_proxy)}
+
+
+def relay_settings_conflict() -> str | None:
+    """他の HTTPS プロキシが既に使われているなら、その説明を返す。"""
+    settings = read_json(_claude_settings_path(), {}) if os.path.exists(_claude_settings_path()) else {}
+    env = (settings or {}).get("env") or {}
+    for where, src in (("settings.json", env), ("shell", os.environ)):
+        for key in ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"):
+            val = src.get(key)
+            if val and val != relay_url():
+                return f"{key}={val} ({where})"
+    return None
+
+
+def relay_settings_apply(enable: bool) -> None:
+    path = _claude_settings_path()
+    settings = read_json(path, None) if os.path.exists(path) else {}
+    if not isinstance(settings, dict):
+        raise RuntimeError(T(f"{path} must contain a JSON object", f"{path} は JSON オブジェクトである必要があります"))
+    env = dict(settings.get("env") or {})
+    rs = relay_state()
+    if enable:
+        new = relay_env_values(env)
+        # 2 回目以降の on では、最初に控えた「元の値」を残す（中継の値で上書きしない）
+        saved = (rs.get("saved_env") if relay_settings_installed() and rs.get("saved_env") is not None
+                 else {k: env.get(k) for k in new})
+        changed = any(env.get(k) != v for k, v in new.items())
+        env.update(new)
+    else:
+        saved = rs.get("saved_env") or {}
+        ours = {"HTTPS_PROXY": relay_url()}
+        changed = False
+        for k in ("HTTPS_PROXY", "NODE_EXTRA_CA_CERTS", "NO_PROXY"):
+            if k not in env:
+                continue
+            if k == "HTTPS_PROXY" and env[k] != ours[k]:
+                continue      # 自分が入れた値でなければ触らない
+            if k == "NODE_EXTRA_CA_CERTS" and not str(env[k]).startswith(RELAY_DIR):
+                continue
+            if saved.get(k) is None:
+                env.pop(k)
+            else:
+                env[k] = saved[k]
+            changed = True
+    if not changed:
+        if enable:
+            s = state()
+            s.setdefault("relay", {}).setdefault("saved_env", saved)
+            save_state(s)
+        return
+    if os.path.exists(path):
+        backup = path + f".bak.{time.time_ns()}"
+        shutil.copy2(path, backup)
+        print(T(f"backup: {backup}", f"バックアップ: {backup}"))
+    if env:
+        settings["env"] = env
+    else:
+        settings.pop("env", None)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    write_json(path, settings)
+    s = state()
+    r = s.setdefault("relay", {})
+    if enable:
+        r["saved_env"] = saved
+    else:
+        r.pop("saved_env", None)
+    save_state(s)
+
+
+def relay_settings_installed() -> bool:
+    settings = read_json(_claude_settings_path(), {}) if os.path.exists(_claude_settings_path()) else {}
+    env = (settings or {}).get("env") or {}
+    return env.get("HTTPS_PROXY") == relay_url() and str(env.get("NODE_EXTRA_CA_CERTS") or "").startswith(RELAY_DIR)
+
+
+def set_relay_enabled(on: bool) -> None:
+    s = state()
+    s.setdefault("relay", {})["enabled"] = on
+    save_state(s)
+
+
+def install_main_login() -> str | None:
+    """Keychain（本体のログイン）をメインにする。失敗理由を返す。"""
+    main = main_slug("claude")
+    if not main:
+        return T("no main account", "メインアカウントが未設定です")
+    sync_live_credentials()
+    live_rt = (current_oauth() or {}).get("refreshToken")
+    stored = stored_oauth(main)
+    if not stored:
+        return T("no stored credential in keychain", "Keychain に認証情報がありません")
+    if live_rt and live_rt == stored.get("refreshToken"):
+        return None
+    try:
+        install_oauth(ensure_fresh(main, stored))
+    except RuntimeError as e:
+        return str(e)
+    log(f"relay: 本体のログインをメイン {main} にしました")
+    return None
+
+
 def cmd_watch(args) -> int:
     cfg = config()
     th = args.threshold if args.threshold is not None else cfg["hotswap_threshold"]
@@ -2755,6 +4232,7 @@ def cmd_watch(args) -> int:
     while True:
         try:
             mark_watch_alive()
+            relay_supervise()     # 中継が有効なら、このプロセスの中で動かし続ける
             clear_expired_cooldowns()
             reconcile_current()   # 手動 login で外から差し替えられていても追従する
             cur = get_current("claude")
@@ -2766,27 +4244,25 @@ def cmd_watch(args) -> int:
                 label = {"five_hour": "5h", "seven_day": "7d"}[lv["kind"]]
                 swapped = hotswap(lv["kind"], f"{label} {lv['pct']:.0f}%", lv.get("resets_at"))
 
-            # 1.5) 次弾の事前ウォームアップ（現用の5h使用率が閾値を超えたら軽く1回検証）
+            # 1.5) 次弾の事前ウォームアップ（現用の使用率が閾値を超えたら軽く1回検証）
             #      Keychain の現用スロットには触れないので稼働中セッションに影響しない
             if not swapped and cur:
-                pct5 = live_five_hour_pct()
-                if pct5 is not None and pct5 >= cfg["warm_threshold"]:
+                peak = live_peak_pct()
+                if peak is not None and peak >= cfg["warm_threshold"]:
                     target, _ = next_slug(cur, probe_all=False)
                     if target and target != cur and not already_warmed(target):
                         ok, msg = warm_account(target)
                         mark_warmed(target, ok, msg)
                         label = (find_account(target) or {}).get("label", target)
                         if ok:
-                            log(f"warm: {target} OK (5h={pct5:.0f}%)")
+                            log(f"warm: {target} OK (peak={peak:.0f}%)")
                         else:
                             log(f"warm: {target} NG: {msg}")
                             notify("🔫 claude-magazine", f"⚠ 次弾 {label} の事前検証に失敗: {msg[:60]}")
 
             # 1.7) Codex 側の監視。セッション JSONL に書かれた rate_limits を読む。
-            #      Claude と違い auth.json の差し替えは即時には効かない。codex は認証を
-            #      ターンの区切り（と認証エラーからの復帰）でしか読み直さないので、開いて
-            #      いるセッションは次のターンまで前のアカウントのまま走る（実測: 反映まで
-            #      十数分、その間に上限メッセージが1回出る）。
+            #      do_load は共有サーバーへ認証を同期する常駐処理も起動する。
+            #      送信済みのリクエストはそのまま完了し、以降のリクエストで新しい認証を使う。
             cur_cx = get_current("codex")
             if cur_cx and accounts_of("codex"):
                 since = (state().get("last_switch_by") or {}).get("codex")
@@ -2803,13 +4279,25 @@ def cmd_watch(args) -> int:
                             log(f"hotswap[codex]: {cur_cx} → {nxt} ({cw['label']} {cw['pct']:.0f}%)")
                             notify("🔫 claude-magazine",
                                    f"Codex {cw['label']} {cw['pct']:.0f}% → {lbl} に装填"
-                                   + ("（開いているセッションは次のターンから）"
+                                   + ("（共有サーバーへ認証を同期）"
                                       if codex_session_recently_active() else ""))
 
             # 2) usage API（低頻度の裏取り。429 ならその時点で上限確定）
             if not swapped and now() - last_api > args.api_interval:
                 last_api = now()
-                if cur:
+                # 2.0) 予備で動いている間にメインが空いたら戻す（Artifact などを散らさない）
+                main, _why = main_ready("claude")
+                if main and do_load(main, "return to main"):
+                    log(f"return to main: {cur} → {main}")
+                    notify("🔫 claude-magazine", f"メインの {label_of(main)} に戻しました")
+                    cur, swapped = main, True
+                # Codex は残量 API を使わず、上限の記録だけで判断する。
+                # 戻せなかった（認証切れなど）場合に毎周回やり直さないよう、この間隔で見る。
+                cx_main, _why = main_ready("codex", probe_main=False)
+                if cx_main and do_load(cx_main, "return to main"):
+                    log(f"return to main[codex]: → {cx_main}")
+                    notify("🔫 claude-magazine", f"Codex をメインの {label_of(cx_main)} に戻しました")
+                if cur and not swapped:
                     p = probe(cur)
                     if not p["ok"]:
                         # 残量が読めないだけでは切り替えない（使用量API側の絞りと区別できないため）。
@@ -2824,7 +4312,7 @@ def cmd_watch(args) -> int:
                                 break
 
             # 上限が近いほど短い間隔で見る（枠を超えて課金域に入らないため）
-            pct_now = live_five_hour_pct() or 0.0
+            pct_now = live_peak_pct() or 0.0
             nap = interval
             for edge, sec in cfg.get("poll_schedule") or []:
                 if pct_now >= edge:
@@ -2971,6 +4459,19 @@ def cmd_doctor(args) -> int:
     name = real.get("label") if real else T("an unregistered account", "未登録のアカウント")
     print(T(f"active Claude acct : {describe(real) if real else name}",
             f"実際の Claude 現用 : {describe(real) if real else name}"))
+    if relay_enabled():
+        main = main_slug("claude")
+        listening, wired = relay_listening(), relay_settings_installed()
+        print(T(f"relay              : on — login {label_of(main)}, usage {label_of(get_current('claude'))}",
+                f"中継               : ON — ログイン {label_of(main)}、利用枠 {label_of(get_current('claude'))}"))
+        print(T(f"  listening        : {'OK' if listening else 'NO — Claude Code cannot connect (is mag watch running?)'}",
+                f"  待ち受け         : {'OK' if listening else 'なし — Claude Code が接続できません（mag watch は動いていますか）'}"))
+        print(T(f"  settings env     : {'OK' if wired else 'missing — run `mag relay on`'}",
+                f"  設定の env       : {'OK' if wired else 'なし — `mag relay on` を再実行'}"))
+        if real and main and real["slug"] != main:
+            print(T("  ⚠ Claude Code is not signed in to the main account — run `mag relay on` again",
+                    "  ⚠ Claude Code のログインがメインではありません — `mag relay on` を再実行"))
+        ok &= listening and wired and bool(real and real["slug"] == main)
     st = auth_status()
     if real and st.get("email") and st["email"] != real.get("email"):
         print(f"  ※ `claude auth status` は {st['email']} と表示しますが、"
@@ -3074,7 +4575,128 @@ def cmd_install_statusline(args) -> int:
     return 0
 
 
+# ── 更新の確認 ─────────────────────────────────────────────────────────
+# どのコマンドでも、前回の確認から 24 時間以上たっていたら裏で最新リリースを見に行く。
+# 結果は次の実行で知らせる（待たせない・ネットワークが無くても止まらない）。
+UPDATE_REPO = "shirakawayohane/magazine"
+UPDATE_URL = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
+UPDATE_PATH = os.path.join(ROOT, "update.json")      # state.json とは別（watch と書き込みが競合しない）
+UPDATE_INTERVAL = 24 * 3600
+# 自動で呼ばれるもの・出力を機械が読むものでは知らせない（確認自体はする）
+UPDATE_QUIET_COMMANDS = ("statusline", "watch", "auto", "hit")
+
+
+def version_tuple(v) -> tuple:
+    nums = re.findall(r"\d+", str(v or "").split("-")[0])
+    return tuple(int(n) for n in nums[:3]) if nums else ()
+
+
+def update_check_enabled() -> bool:
+    if os.environ.get("MAGAZINE_NO_UPDATE_CHECK"):
+        return False
+    return bool(config().get("update_check", True))
+
+
+def update_info() -> dict:
+    return read_json(UPDATE_PATH, {}) or {}
+
+
+def update_check_due(now_ts: float | None = None) -> bool:
+    last = update_info().get("checked_at") or 0
+    return (now_ts or time.time()) - last >= UPDATE_INTERVAL
+
+
+def fetch_latest_release() -> None:
+    """GitHub の最新リリースを見て update.json に残す（裏プロセスで動く）。"""
+    info = update_info()
+    info["checked_at"] = time.time()
+    try:
+        rel = http_json(UPDATE_URL, timeout=10) or {}
+        tag = rel.get("tag_name")
+        if tag and version_tuple(tag):
+            info["latest"] = tag
+            info["url"] = rel.get("html_url") or f"https://github.com/{UPDATE_REPO}/releases/tag/{tag}"
+        info.pop("error", None)
+    except Exception as e:                       # 失敗しても次の 24 時間後にまた見る
+        info["error"] = type(e).__name__
+    write_json(UPDATE_PATH, info)
+
+
+def start_update_check() -> None:
+    """確認時刻を先に記録してから、裏で取りに行く（同時に何本も走らせない）。"""
+    info = update_info()
+    info["checked_at"] = time.time()
+    write_json(UPDATE_PATH, info)
+    kw = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+    if IS_WINDOWS:
+        kw["creationflags"] = 0x00000008 | 0x00000200      # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    else:
+        kw["start_new_session"] = True
+    try:
+        subprocess.Popen([sys.executable, os.path.abspath(__file__), "_update-check"], **kw)
+    except OSError as e:
+        log(f"update check: 起動できません: {e}")
+
+
+def available_update() -> str | None:
+    latest = update_info().get("latest")
+    if latest and version_tuple(latest) > version_tuple(VERSION):
+        return latest
+    return None
+
+
+def update_instructions(tag: str) -> str:
+    src = os.path.dirname(os.path.realpath(os.path.abspath(__file__)))
+    if os.path.isdir(os.path.join(src, ".git")):
+        installer = "windows\\install.ps1" if IS_WINDOWS else "./install.sh"
+        try:
+            with open(os.path.join(src, ".git", "HEAD")) as f:
+                on_branch = f.read().startswith("ref:")
+        except OSError:
+            on_branch = False
+        if on_branch:                            # 開発版の clone はブランチを進める
+            return f"cd {src} && git pull --ff-only && {installer}"
+        return f"cd {src} && git fetch --tags && git checkout {tag} && {installer}"
+    return f"https://github.com/{UPDATE_REPO}/releases/tag/{tag}"
+
+
+def maybe_check_update(cmd: str | None) -> None:
+    """コマンド実行のついでに更新を確認し、新しい版があれば 1 日 1 回知らせる。"""
+    if not update_check_enabled():
+        return
+    try:
+        if update_check_due():
+            start_update_check()
+        tag = available_update()
+        if not tag or cmd in UPDATE_QUIET_COMMANDS or not sys.stderr.isatty():
+            return
+        info = update_info()
+        if time.time() - (info.get("notified_at") or 0) < UPDATE_INTERVAL and info.get("notified_tag") == tag:
+            return
+        info["notified_at"], info["notified_tag"] = time.time(), tag
+        write_json(UPDATE_PATH, info)
+        print(T(f"\n⬆ magazine {tag} is available (installed: {VERSION}). Update:\n  {update_instructions(tag)}\n"
+                f"  Then restart the background monitor. Turn these checks off with \"update_check\": false in config.json.",
+                f"\n⬆ magazine {tag} が出ています（いまは {VERSION}）。更新:\n  {update_instructions(tag)}\n"
+                f"  そのあと常駐監視を再起動してください。確認を止めるには config.json に \"update_check\": false。"),
+              file=sys.stderr)
+    except Exception as e:                       # 更新確認でコマンド本体を失敗させない
+        log(f"update check: {type(e).__name__}: {e}")
+
+
 def main() -> int:
+    # Claude Code の中から実行されると、中継用の HTTPS_PROXY を引き継ぐ。
+    # mag 自身の通信は中継に頼らない（中継が止まっていても診断できるように）。
+    for key in ("HTTPS_PROXY", "https_proxy"):
+        if os.environ.get(key) == relay_url():
+            os.environ.pop(key)
+    if sys.argv[1:] == ["_codex-restart-worker"]:
+        return 0  # Retired worker invocation; never restart a provider process.
+    if sys.argv[1:] == ["_codex-auth-worker"]:
+        return cmd_codex_auth_worker(None)
+    if sys.argv[1:] == ["_update-check"]:
+        fetch_latest_release()
+        return 0
     p = argparse.ArgumentParser(
         prog="mag",
         description=T("Pool your Claude Code / Codex subscriptions and switch when one runs out",
@@ -3138,6 +4760,23 @@ Registering (the alias is what you type from then on):
     a.add_argument("name", metavar="ALIAS"); a.add_argument("new_name", metavar="NEW_ALIAS")
     a.set_defaults(func=cmd_rename)
 
+    a = sub.add_parser("main", help=T("set the account that Artifacts and other saved work stay on"
+                                      " (Claude Code stays signed in to it; only usage switches)",
+                                      "Artifact などを集めるメインアカウントを指定"
+                                      "（Claude Code のログインはメインのまま、利用枠だけ切り替え）"))
+    a.add_argument("name", nargs="?", metavar="ALIAS|clear",
+                   help=T("omit to show the current main account(s); `clear` unsets it (Claude: also turns the relay off)",
+                          "省略すると現在のメインを表示。`clear` で解除（Claude は中継も OFF）"))
+    a.add_argument("provider", nargs="?", choices=["claude", "codex"],
+                   help=T("with `clear`: only this provider", "`clear` のとき: この種類だけ解除"))
+    a.add_argument("--clear", choices=["claude", "codex"], help=argparse.SUPPRESS)   # 旧書式
+    a.set_defaults(func=cmd_main)
+
+    a = sub.add_parser("relay", help=T("status of the relay `mag main` turns on; `off` goes back to swapping logins",
+                                       "`mag main` で ON になる中継の状態。`off` で従来のログイン入れ替えに戻す"))
+    a.add_argument("action", nargs="?", choices=["on", "off", "status", "serve"])
+    a.set_defaults(func=cmd_relay)
+
     a = sub.add_parser("status", aliases=["st"], help=T("per-account detail","アカウントごとの詳細"))
     a.add_argument("--quick", action="store_true", help="API を叩かず cooldown だけ表示")
     a.set_defaults(func=cmd_status)
@@ -3152,6 +4791,8 @@ Registering (the alias is what you type from then on):
     a.set_defaults(func=cmd_limits)
 
     a = sub.add_parser("load", aliases=["use"], help=T("switch to an account by alias (unique prefix ok)","alias でアカウントに切り替え（一意な先頭文字列で可）"))
+    a.add_argument("--restart-codex", action="store_true",
+                   help=argparse.SUPPRESS)  # Compatibility alias; authentication sync is the default.
     a.add_argument("alias", metavar="ALIAS"); a.set_defaults(func=cmd_load)
 
     a = sub.add_parser("next", help=T("advance to the next account","次のアカウントに切り替え"))
@@ -3200,9 +4841,11 @@ Registering (the alias is what you type from then on):
 
     args = p.parse_args()
     try:
-        return args.func(args)
+        rc = args.func(args)
     except KeyboardInterrupt:
         return 130
+    maybe_check_update(args.cmd)
+    return rc
 
 
 if __name__ == "__main__":
