@@ -23,9 +23,9 @@ resume preview, not a live AI session. [Text version and reproduction](docs/demo
   when reported usage reaches a threshold.
 - **Find interrupted work.** `mag stalled` locates Claude Code sessions with recorded
   limit or login errors. `mag resume` selects an account and opens the existing session.
-- **Keep your work on one account.** After `mag main ALIAS`, Claude Code stays signed in to
-  that main account — Artifacts, Remote Control, and everything else stay there — while
-  only the usage moves between accounts. [How the relay works](docs/guide.md#relay-switch-only-the-usage).
+- **Keep your work on one account.** After `mag main ALIAS`, Claude Code (or Codex) stays
+  signed in to that main account — Artifacts, Remote Control, Cloud tasks and everything
+  else stay there — while only the usage moves between accounts. [How the relay works](docs/guide.md#relay-switch-only-the-usage).
 - **Small install.** One Python script, standard library only. No proxy server until you choose a main account, and no
   extra Python packages. Optional shell integration checks accounts before launching
   the usual CLI.
@@ -49,7 +49,7 @@ On macOS/Linux, the Python command must be `python3`; on Windows, `python.exe`.
 Clone the tagged release so you can inspect the installer before running it:
 
 ```sh
-git clone --branch v0.1.3 --depth 1 https://github.com/shirakawayohane/magazine.git
+git clone --branch v0.1.4 --depth 1 https://github.com/shirakawayohane/magazine.git
 cd magazine
 ```
 

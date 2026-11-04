@@ -166,10 +166,11 @@ only when the relay is off.
 ### Relay: switch only the usage
 
 ```sh
-mag main main      # sets the main account and turns the relay on
+mag main main         # sets the main account and turns the relay on
+mag main codex-main   # the same for Codex
 mag relay status
-mag relay off      # back to replacing the Claude Code login on every switch
-mag relay on       # turn it back on for the current main account
+mag relay off         # back to replacing the login on every switch (both, or `off codex`)
+mag relay on          # turn it back on for the current main accounts
 ```
 
 With the relay on, Claude Code is always signed in to the main account. Only its
@@ -204,6 +205,32 @@ How it works:
 
 Pointing Claude Code at the relay with `ANTHROPIC_BASE_URL` instead was tested and
 rejected: Claude Code then turns off Remote Control and some tools.
+
+#### Codex
+
+Codex needs no certificate or proxy. `mag main CODEX_ALIAS` adds one line to the top of
+Codex's `config.toml` (backed up first):
+
+```toml
+openai_base_url = "http://127.0.0.1:47822/backend-api/codex"
+```
+
+That moves only Codex's conversation traffic (the model list and responses) to the
+relay, which forwards it to `chatgpt.com` over HTTPS. Remote control, Cloud tasks,
+plugins and the account page keep going straight to OpenAI with the main login, so
+`auth.json` always holds the main account. When a spare's usage is being spent, the
+relay sends conversation requests with that spare's credential and account ID.
+
+- Codex reads `config.toml` when it starts. Restart the Codex app, open sessions and the
+  shared background server (`codex app-server`) after turning the relay on or off.
+- Codex keeps one connection open for a conversation. After a switch, the relay closes
+  connections made for the previous account once they have been quiet for 3 seconds;
+  Codex reconnects and the next turn uses the new account.
+- If the spare is rejected (401/403), the relay uses the main account for 10 minutes and
+  notifies you.
+- The relay listens on `127.0.0.1:47822` (`codex_relay_port`). If it is not running, new
+  Codex conversations cannot connect. `mag main clear codex` removes the line again.
+- Not available on Windows, or when `openai_base_url` / `OPENAI_BASE_URL` is already set.
 
 ## Usage data and network access
 
@@ -278,6 +305,8 @@ Configuration is read from `config.json` in the magazine data directory:
 | `min_switch_interval` | `20` | Minimum interval in seconds for the Claude hot-swap guard |
 | `poll_schedule` | `[[90, 3], [80, 8], [0, 20]]` | Usage threshold / seconds between local checks |
 | `update_check` | `true` | Check GitHub for a newer release once a day |
+| `relay_port` | `47821` | Claude relay port on `127.0.0.1` |
+| `codex_relay_port` | `47822` | Codex relay port on `127.0.0.1` |
 
 For example, `{"hotswap_threshold": 95.0, "warm_threshold": 101.0}` switches earlier
 and prevents the usual 0–100% usage signal from triggering a model pre-check.

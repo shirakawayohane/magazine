@@ -48,7 +48,7 @@ import urllib.request
 import uuid
 from datetime import datetime, timedelta, timezone
 
-VERSION = "0.1.3"
+VERSION = "0.1.4"
 
 HOME = os.path.expanduser("~")
 
@@ -191,6 +191,8 @@ DEFAULT_CONFIG = {
     "update_check": True,
     # 中継（mag relay）の待ち受けポート（127.0.0.1 のみ）
     "relay_port": 47821,
+    # Codex の中継（openai_base_url の向け先）の待ち受けポート（127.0.0.1 のみ）
+    "codex_relay_port": 47822,
 }
 
 # ── 小物 ────────────────────────────────────────────────────────────────
@@ -902,6 +904,8 @@ def codex_session_recently_active(within: float = 1800) -> bool:
 
 
 def codex_switch_note(name: str) -> str | None:
+    if codex_relay_enabled():
+        return None              # 中継中は次の接続から切り替わる
     if os.path.lexists(codex_daemon_socket()) or not codex_session_recently_active():
         return None
     return T(f"  note: standalone Codex processes may still use the previous account instead of {name}. "
@@ -1870,7 +1874,7 @@ def reconcile_current() -> dict:
                 break
 
     matched = codex_sync_live()   # codex も rotation で保管庫が古びる
-    if matched and get_current("codex") != matched:
+    if matched and get_current("codex") != matched and not codex_relay_enabled():
         set_current("codex", matched)
         fixed["codex"] = matched
         log(f"reconcile: codex の現在弾を {matched} に修正")
@@ -1994,6 +1998,8 @@ def do_load(slug: str, reason: str = "") -> bool:
     if provider_of(find_account(slug) or {}) == "codex":
         with codex_auth_lock():
             ok = _do_load(slug, reason)
+        if ok and codex_relay_enabled():
+            return True                   # ログインは動かしていないので、共有サーバーへ渡すものはない
         return codex_apply_selection() if ok else False
     return _do_load(slug, reason)
 
@@ -2011,7 +2017,8 @@ def _do_load(slug: str, reason: str = "") -> bool:
         outgoing = codex_sync_live()
         # 装填してから死んでいると分かっても遅い（codex 本体が auth.json を
         # 消してしまい、直前まで使えていたログインごと失う）。先に確かめる。
-        auth, dead, checked = codex_ensure_fresh(slug, auth, verify=True)
+        # 中継が同じ予備を同時に更新しないよう、ロックの中で読み直して更新する。
+        auth, dead, checked = codex_fresh_locked(slug, verify=True)
         if dead:
             print(T(f"✗ {name}: {dead} — run `mag login codex {name}` to sign in again "
                     f"(the active account is left as it is)",
@@ -2031,11 +2038,17 @@ def _do_load(slug: str, reason: str = "") -> bool:
             log(f"load deferred: {slug}: could not verify (network)")
             return False
         try:
-            # 認証情報と state の持ち主が一致する場合だけ、切替前の記録を保存する。
-            # 手動ログインなどで食い違っている場合は他アカウントへの誤帰属を避ける。
-            if outgoing and outgoing == get_current("codex"):
-                codex_usage_snapshot(outgoing)
-            codex_install_auth(auth)
+            if codex_relay_enabled():
+                # 中継中はログイン（auth.json＝メイン）を動かさない。使う枠だけを切り替え、
+                # 中継が次の接続からこのアカウントの認証で送る。
+                if get_current("codex"):
+                    codex_usage_snapshot(get_current("codex"))
+            else:
+                # 認証情報と state の持ち主が一致する場合だけ、切替前の記録を保存する。
+                # 手動ログインなどで食い違っている場合は他アカウントへの誤帰属を避ける。
+                if outgoing and outgoing == get_current("codex"):
+                    codex_usage_snapshot(outgoing)
+                codex_install_auth(auth)
         except (RuntimeError, OSError) as e:
             print(T(f"✗ failed to activate {name}: {e}", f"✗ {name} への切り替えに失敗: {e}"), file=sys.stderr)
             log(f"load failed: {slug}: {e}")
@@ -2479,6 +2492,9 @@ def cmd_main(args) -> int:
             if prov == "claude" and (relay_enabled() or relay_settings_installed()):
                 if relay_turn_off() != 0:          # 中継はメインが前提。先に止めて設定を戻す
                     return 1
+            if prov == "codex" and (codex_relay_enabled() or codex_config_installed()):
+                if codex_relay_turn_off() != 0:
+                    return 1
             had = main_slug(prov)
             set_main(None, prov)
             if had or clear != "all":
@@ -2505,13 +2521,14 @@ def cmd_main(args) -> int:
     prov = provider_of(acct)
     set_main(acct["slug"], prov)
     print(T(f"★ main {prov} account: {describe(acct)}", f"★ {prov} のメインアカウント: {describe(acct)}"))
-    if prov == "claude" and not IS_WINDOWS:
+    if not IS_WINDOWS:
         # メインを決めたら中継も ON: ログインはメインに固定し、切り替えるのは利用枠だけにする
-        if relay_turn_on() != 0:
-            print(T("  The main account is set, but switching still replaces the Claude Code login."
-                    " Fix the problem above and run `mag relay on`.",
-                    "  メインは設定しましたが、切り替えは従来どおり Claude Code のログインを入れ替えます。"
-                    "上の問題を直して `mag relay on` を実行してください。"), file=sys.stderr)
+        app = "Claude Code" if prov == "claude" else "Codex"
+        if (relay_turn_on() if prov == "claude" else codex_relay_turn_on()) != 0:
+            print(T(f"  The main account is set, but switching still replaces the {app} login."
+                    f" Fix the problem above and run `mag relay on {prov}`.",
+                    f"  メインは設定しましたが、切り替えは従来どおり {app} のログインを入れ替えます。"
+                    f"上の問題を直して `mag relay on {prov}` を実行してください。"), file=sys.stderr)
             return 1
         print(T("  When a spare's usage is in use, magazine moves back to this account's usage as soon as it is usable"
                 " (`mag watch` checks every few minutes; a `mag use` choice is left alone).",
@@ -2531,6 +2548,17 @@ def cmd_main(args) -> int:
 def cmd_relay(args) -> int:
     """利用枠だけを予備へ回す中継の on / off / status / serve。"""
     action = args.action or "status"
+    if action == "serve" and getattr(args, "provider", None) == "codex":
+        srv = CodexRelayServer(codex_relay_port())
+        srv.start()
+        print(T(f"Codex relay listening on {codex_relay_url()} (Ctrl-C to stop)",
+                f"Codex の中継: {codex_relay_url()} で待ち受け中（Ctrl-C で停止）"))
+        try:
+            while srv.alive():
+                time.sleep(1)
+        except KeyboardInterrupt:
+            srv.stop()
+        return 0
     if action == "serve":
         if not relay_enabled():
             print(T("relay is off — `mag relay on` first", "中継は無効です。先に `mag relay on`"), file=sys.stderr)
@@ -2545,15 +2573,39 @@ def cmd_relay(args) -> int:
             srv.stop()
         return 0
 
-    if action == "on":
-        return relay_turn_on()
-
-    if action == "off":
-        return relay_turn_off()
+    provs = (args.provider,) if getattr(args, "provider", None) else ("claude", "codex")
+    if action in ("on", "off"):
+        rc = 0
+        if action == "on" and len(provs) > 1:
+            # 両方まとめて ON のときは、メインのある方だけ（どちらも無ければ Claude の案内を出す）
+            provs = tuple(p for p in provs if main_slug(p)) or ("claude",)
+        for prov in provs:
+            if action == "off" and len(provs) > 1 and prov == "codex" \
+                    and not (codex_relay_enabled() or codex_config_installed()):
+                continue
+            if prov == "claude":
+                rc |= relay_turn_on() if action == "on" else relay_turn_off()
+            else:
+                rc |= codex_relay_turn_on() if action == "on" else codex_relay_turn_off()
+        return rc
 
     # status
+    if "codex" in provs:
+        con = codex_relay_enabled()
+        print(T(f"Codex relay: {'on' if con else 'off'}", f"Codex の中継: {'ON' if con else 'OFF'}"))
+        if con:
+            print(T(f"  login (remote control etc.): {label_of(main_slug('codex'))}   usage: {label_of(get_current('codex'))}",
+                    f"  ログイン（リモート操作など）: {label_of(main_slug('codex'))}   利用枠: {label_of(get_current('codex'))}"))
+            print(T(f"  listening: {'yes' if codex_relay_listening() else 'NO — new Codex conversations cannot connect'}"
+                    f" ({codex_relay_url()})",
+                    f"  待ち受け: {'OK' if codex_relay_listening() else 'なし — 新しい Codex の会話が接続できません'}"
+                    f" ({codex_relay_url()})"))
+            print(T(f"  Codex settings: {'ok' if codex_config_installed() else 'missing — run `mag relay on codex`'}",
+                    f"  Codex の設定: {'OK' if codex_config_installed() else 'なし — `mag relay on codex` を再実行'}"))
+    if "claude" not in provs:
+        return 0
     on = relay_enabled()
-    print(T(f"relay: {'on' if on else 'off'}", f"中継: {'ON' if on else 'OFF'}"))
+    print(T(f"Claude relay: {'on' if on else 'off'}", f"Claude の中継: {'ON' if on else 'OFF'}"))
     if on:
         print(T(f"  login (Artifacts etc.): {label_of(main_slug('claude'))}   usage: {label_of(get_current('claude'))}",
                 f"  ログイン（Artifact など）: {label_of(main_slug('claude'))}   利用枠: {label_of(get_current('claude'))}"))
@@ -2671,6 +2723,12 @@ def cmd_status(args) -> int:
             print(T(f"   relay on: signed in as {label_of(main_slug('claude'))} (Artifacts etc.),"
                     f" usage from ▶{'' if ok else '   ⚠ relay not listening'}",
                     f"   中継 ON: ログインは {label_of(main_slug('claude'))}（Artifact など）、利用枠は ▶"
+                    f"{'' if ok else '   ⚠ 中継が待ち受けていません'}"))
+        if prov == "codex" and codex_relay_enabled():
+            ok = codex_relay_listening()
+            print(T(f"   relay on: signed in as {label_of(main_slug('codex'))} (remote control etc.),"
+                    f" usage from ▶{'' if ok else '   ⚠ relay not listening'}",
+                    f"   中継 ON: ログインは {label_of(main_slug('codex'))}（リモート操作など）、利用枠は ▶"
                     f"{'' if ok else '   ⚠ 中継が待ち受けていません'}"))
         rc |= _print_magazine(accs, prov, args)
         if prov == "codex":
@@ -3009,7 +3067,7 @@ def _cmd_load(args) -> int:
         print(T("  Manual selection: automatic switching waits for 100% usage.",
                 "  手動選択を優先: 使用率100%になるまで自動切替しません。"))
         if prov == "codex":
-            return 0 if codex_apply_selection() else 1
+            return 0 if (codex_relay_enabled() or codex_apply_selection()) else 1
         print_codex_switch_note(prov, display(acct))
         return 0
     if not do_load(acct["slug"], "manual"):
@@ -3928,7 +3986,7 @@ def _send_body_chunked(src, dst, buf: bytes) -> bytes:
         buf = _send_body_exact(src, dst, buf, size + 2)
 
 
-def relay_forward_requests(client, upstream, auth: RelayAuth, buf: bytes = b"") -> None:
+def relay_forward_requests(client, upstream, auth, buf: bytes = b"", rewrite=None) -> None:
     """クライアント→上流の向きを、リクエスト単位で読みながら流す。
 
     上流→クライアントは中身を変えないので、別スレッドでそのまま流す。
@@ -3938,7 +3996,7 @@ def relay_forward_requests(client, upstream, auth: RelayAuth, buf: bytes = b"") 
         head, buf = _recv_head(client, buf)
         if head is None:
             return
-        head, hdr, _swapped = rewrite_request_head(head, auth)
+        head, hdr, _swapped = rewrite(head) if rewrite else rewrite_request_head(head, auth)
         upstream.sendall(head)
         if "upgrade" in hdr.get("connection", "").lower():
             if buf:
@@ -3951,13 +4009,28 @@ def relay_forward_requests(client, upstream, auth: RelayAuth, buf: bytes = b"") 
             buf = _send_body_exact(client, upstream, buf, int(hdr["content-length"]))
 
 
+def _relay_close(sock) -> None:
+    if sock is not None:
+        # close alone need not wake a thread blocked in recv on this socket.
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        sock.close()
+
+
 class RelayServer:
+    # Two sockets per tunnel: leave room under a 256-FD limit for the watcher,
+    # credential helpers and the listening socket (64 * 2 = 128 descriptors).
+    MAX_CONNECTIONS = 64
+
     def __init__(self, port: int, auth: RelayAuth | None = None):
         self.port = port
         self.auth = auth or RelayAuth()
         self.sock = None
         self.thread = None
         self._server_ctx = None
+        self._slots = threading.BoundedSemaphore(self.MAX_CONNECTIONS)
 
     def server_ctx(self):
         if self._server_ctx is None:
@@ -3969,45 +4042,71 @@ class RelayServer:
 
     def start(self) -> None:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind(("127.0.0.1", self.port))
-        s.listen(128)
         self.sock = s
-        self.server_ctx()        # 証明書の不備はここで分かるようにする
-        self.thread = threading.Thread(target=self._accept_loop, name="mag-relay", daemon=True)
-        self.thread.start()
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("127.0.0.1", self.port))
+            s.listen(128)
+            s.settimeout(0.5)
+            self.server_ctx()        # 証明書の不備はここで分かるようにする
+            self.thread = threading.Thread(target=self._accept_loop, args=(s,), name="mag-relay", daemon=True)
+            self.thread.start()
+        except Exception:
+            self.stop()
+            raise
         log(f"relay: 127.0.0.1:{self.port} で待ち受け開始")
 
     def stop(self) -> None:
-        if self.sock:
-            try:
-                self.sock.close()
-            except OSError:
-                pass
+        s = self.sock
         self.sock = None
+        _relay_close(s)
+        if self.thread and self.thread.is_alive() and self.thread is not threading.current_thread():
+            self.thread.join(2)
 
     def alive(self) -> bool:
         return bool(self.sock and self.thread and self.thread.is_alive())
 
-    def _accept_loop(self) -> None:
-        while self.sock:
-            try:
-                c, addr = self.sock.accept()
-            except OSError:
-                break
-            threading.Thread(target=self._handle, args=(c, addr), daemon=True).start()
+    def _accept_loop(self, listener) -> None:
+        try:
+            while self.sock is listener:
+                if not self._slots.acquire(timeout=0.5):
+                    continue
+                dispatched = False
+                c = None
+                try:
+                    c, addr = listener.accept()
+                    threading.Thread(target=self._serve_client, args=(c, addr), daemon=True).start()
+                    dispatched = True
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                finally:
+                    if not dispatched:
+                        _relay_close(c)
+                        self._slots.release()
+        finally:
+            # A failed accept must not leave a dead listener occupying the port.
+            if self.sock is listener:
+                self.sock = None
+            _relay_close(listener)
+
+    def _serve_client(self, client, addr) -> None:
+        try:
+            self._handle(client, addr)
+        finally:
+            self._slots.release()
 
     def _handle(self, client, addr) -> None:
+        upstream = None
         try:
             client.settimeout(30)
             head, rest = _recv_head(client, b"")
             if not head:
-                client.close()
                 return
             parts = head.split(b"\r\n", 1)[0].decode("latin-1").split(" ")
             if len(parts) < 2 or parts[0] != "CONNECT":
                 client.sendall(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                client.close()
                 return
             host, _, port = parts[1].rpartition(":")
             host, port = host.strip("[]"), int(port or 443)
@@ -4015,7 +4114,6 @@ class RelayServer:
                 upstream = socket.create_connection((host, port), timeout=30)
             except OSError:
                 client.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                client.close()
                 return
             client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             client.settimeout(None)
@@ -4029,17 +4127,11 @@ class RelayServer:
                 back.start()
                 _pipe(client, upstream)
                 back.join(30)
-                for sock_ in (client, upstream):
-                    try:
-                        sock_.close()
-                    except OSError:
-                        pass
         except Exception as e:
             log(f"relay: 接続処理エラー: {type(e).__name__}: {e}")
-            try:
-                client.close()
-            except OSError:
-                pass
+        finally:
+            _relay_close(client)
+            _relay_close(upstream)
 
     def _intercept(self, client, upstream_raw, rest: bytes) -> None:
         tls_client = tls_up = None
@@ -4047,46 +4139,51 @@ class RelayServer:
             if rest:
                 # TLS が始まる前にデータが来ることはない（CONNECT の応答待ちのはず）
                 raise ValueError("unexpected bytes before TLS")
+            client.settimeout(30)
+            upstream_raw.settimeout(30)
             tls_client = self.server_ctx().wrap_socket(client, server_side=True)
             up_ctx = ssl.create_default_context()
             up_ctx.set_alpn_protocols(["http/1.1"])
             tls_up = up_ctx.wrap_socket(upstream_raw, server_hostname=RELAY_HOST)
+            tls_client.settimeout(None)
+            tls_up.settimeout(None)
             threading.Thread(target=_pipe, args=(tls_up, tls_client), daemon=True).start()
             relay_forward_requests(tls_client, tls_up, self.auth)
         except (OSError, EOFError, ValueError, ssl.SSLError):
             pass
         finally:
             for s in (tls_client, tls_up, client, upstream_raw):
-                if s is not None:
-                    try:
-                        s.close()
-                    except OSError:
-                        pass
+                _relay_close(s)
 
 
-_RELAY_SERVER: RelayServer | None = None
-_RELAY_FAIL_AT = 0.0
+_RELAY_SERVERS: dict = {}       # "claude" / "codex" -> 動いている中継
+_RELAY_FAIL_AT: dict = {}
 
 
 def relay_supervise() -> None:
-    """mag watch の周回ごとに呼ぶ。有効なら中継を動かし、無効なら止める。"""
-    global _RELAY_SERVER, _RELAY_FAIL_AT
-    want = relay_enabled()
-    if want and not (_RELAY_SERVER and _RELAY_SERVER.alive()):
-        if now() - _RELAY_FAIL_AT < 60:
-            return
-        try:
-            srv = RelayServer(relay_port())
-            srv.start()
-            _RELAY_SERVER = srv
-        except Exception as e:
-            _RELAY_FAIL_AT = now()
-            log(f"relay: 起動できません: {e}")
-            notify("🔫 claude-magazine", f"中継を起動できません（Claude Code が繋がりません）: {e}")
-    elif not want and _RELAY_SERVER:
-        _RELAY_SERVER.stop()
-        _RELAY_SERVER = None
-        log("relay: 停止しました")
+    """mag watch の周回ごとに呼ぶ。有効な中継を動かし、無効になったものを止める。"""
+    for prov, want, make, who in (
+            ("claude", relay_enabled(), lambda: RelayServer(relay_port()), "Claude Code"),
+            ("codex", codex_relay_enabled(), lambda: CodexRelayServer(codex_relay_port()), "Codex")):
+        srv = _RELAY_SERVERS.get(prov)
+        if want and not (srv and srv.alive()):
+            if now() - _RELAY_FAIL_AT.get(prov, 0) < 60:
+                continue
+            if srv:
+                srv.stop()
+                _RELAY_SERVERS.pop(prov, None)
+            try:
+                srv = make()
+                srv.start()
+                _RELAY_SERVERS[prov] = srv
+            except Exception as e:
+                _RELAY_FAIL_AT[prov] = now()
+                log(f"relay({prov}): 起動できません: {e}")
+                notify("🔫 claude-magazine", f"中継を起動できません（{who} が繋がりません）: {e}")
+        elif not want and srv:
+            srv.stop()
+            _RELAY_SERVERS.pop(prov, None)
+            log(f"relay({prov}): 停止しました")
 
 
 def relay_listening(timeout: float = 1.0) -> bool:
@@ -4095,6 +4192,470 @@ def relay_listening(timeout: float = 1.0) -> bool:
             return True
     except OSError:
         return False
+
+
+# ── Codex の中継（利用枠だけを予備へ回す） ──
+# Codex は config.toml の openai_base_url で、会話（モデル一覧と responses）の行き先だけを
+# 変えられる。そこを手元の平文 HTTP 中継に向け、中継が chatgpt.com へ TLS で送り直す。
+# リモート操作・Cloud タスク・プラグインは別の道（/backend-api/wham など）で直接行くので、
+# ログイン（auth.json）はメインのまま残る。証明書も環境変数も使わない。
+CODEX_UPSTREAM = "chatgpt.com"
+CODEX_RELAY_PREFIX = "/backend-api/codex"
+CODEX_RELAY_MARK = "# added by magazine: Codex usage relay (`mag main clear codex` removes it)"
+CODEX_FAIL_HOLD = 600          # 予備が 401/403 を返したら、この秒数はメインのまま通す
+CODEX_IDLE_CLOSE = 3.0         # 枠の持ち主が変わった接続は、この秒数無通信になったら閉じる
+
+
+def codex_relay_port() -> int:
+    return int(config().get("codex_relay_port") or 47822)
+
+
+def codex_relay_url() -> str:
+    return f"http://127.0.0.1:{codex_relay_port()}{CODEX_RELAY_PREFIX}"
+
+
+def codex_relay_enabled() -> bool:
+    return bool((state().get("relay_codex") or {}).get("enabled"))
+
+
+def set_codex_relay_enabled(on: bool) -> None:
+    s = state()
+    s.setdefault("relay_codex", {})["enabled"] = on
+    save_state(s)
+
+
+def codex_account_id(auth: dict | None) -> str | None:
+    auth = auth or {}
+    return (auth.get("tokens") or {}).get("account_id") or codex_identity(auth).get("account_id")
+
+
+def codex_fresh_locked(slug: str, verify: bool = False) -> tuple[dict | None, str | None, bool]:
+    """保管庫の認証を、プロセス間ロックの中で必要なら更新する。
+
+    refresh token は使い捨てなので、中継（watch の中）と `mag use` が同時に
+    同じ予備を更新すると、遅れた方が「失効」と誤判定する。ロックの中で
+    保管庫を読み直してから更新する。
+    """
+    with file_lock(os.path.join(ROOT, "locks", f"codex-refresh-{slug}.lock")):
+        auth = codex_stored_auth(slug)
+        if not auth:
+            return None, T("no stored credential", "認証情報がありません"), True
+        return codex_ensure_fresh(slug, auth, verify=verify)
+
+
+class CodexRelayAuth:
+    """Codex の会話リクエストを、どのアカウントの認証で送るか決める。"""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._tokens = {}          # slug -> (access_token, account_id, 期限)
+        self._main_id = (None, None, 0.0)   # (main slug, account id, 読んだ時刻)
+        self._failed = {}          # slug -> この時刻まで使わない
+        self._warned = {}
+        self._live = (None, 0.0)   # (auth.json の access token, 読んだ時刻)
+
+    def _is_live(self, token: str) -> bool:
+        """届いた認証が auth.json のログイン（メイン）そのものか。
+
+        アカウント番号だけでは、ログインを持たない別のプロセス（同じ Mac の別ユーザー
+        を含む）が予備の枠を使えてしまう。メインのトークンを持っている者だけを通す。
+        """
+        with self._lock:
+            live, at = self._live
+        if token == live:
+            return True
+        if now() - at < 1.0:
+            return False
+        live = ((codex_live_auth() or {}).get("tokens") or {}).get("access_token")
+        with self._lock:
+            self._live = (live, now())
+        return bool(live) and token == live
+
+    def main_account_id(self, main: str) -> str | None:
+        with self._lock:
+            slug, acc, at = self._main_id
+        if slug == main and acc and now() - at < 60:
+            return acc
+        acc = codex_account_id(codex_stored_auth(main))
+        with self._lock:
+            self._main_id = (main, acc, now())
+        return acc
+
+    def paying(self) -> str | None:
+        """いま枠を使わせたい予備の slug。メインのまま通すなら None。"""
+        if not codex_relay_enabled():
+            return None
+        cur, main = get_current("codex"), main_slug("codex")
+        if not cur or not main or cur == main:
+            return None
+        with self._lock:
+            if self._failed.get(cur, 0) > now():
+                return None
+        return cur
+
+    def token_for(self, slug: str) -> tuple[str, str] | None:
+        with self._lock:
+            hit = self._tokens.get(slug)
+        if hit and hit[2] - now() > 120:
+            return hit[0], hit[1]
+        auth, dead, _checked = codex_fresh_locked(slug)
+        tok = ((auth or {}).get("tokens") or {}).get("access_token")
+        acc = codex_account_id(auth)
+        exp = jwt_claims(tok or "").get("exp") or 0
+        if dead or not tok or not acc or (exp and exp <= now()):
+            return None
+        with self._lock:
+            self._tokens[slug] = (tok, acc, exp or now() + 300)
+        return tok, acc
+
+    def replacement(self, account_header: str | None, bearer: str | None) -> tuple[str, str, str] | None:
+        """(slug, access token, account id)。差し替えないなら None。"""
+        slug = self.paying()
+        if not slug or not account_header or not bearer:
+            return None
+        main = main_slug("codex")
+        if account_header != self.main_account_id(main) or not self._is_live(bearer):
+            return None            # メインのログイン以外から来たものは触らない
+        try:
+            got = self.token_for(slug)
+            err = None
+        except Exception as e:
+            got, err = None, e
+        if not got:
+            self._warn(slug, f"認証を用意できず ({err or 'no token'})")
+            return None
+        return slug, got[0], got[1]
+
+    def mark_failed(self, slug: str, status: int) -> None:
+        with self._lock:
+            self._failed[slug] = now() + CODEX_FAIL_HOLD
+            self._tokens.pop(slug, None)
+        self._warn(slug, f"上流が {status} を返した")
+
+    def _warn(self, slug: str, why: str) -> None:
+        if now() - self._warned.get(slug, 0) < 3600:
+            return
+        self._warned[slug] = now()
+        log(f"relay(codex): {slug} の{why}ため、メインの枠で送信します")
+        notify("🔫 claude-magazine", f"Codex: {label_of(slug)} が使えないため、メインの枠で送信しています")
+
+
+class CodexConn:
+    """中継中の 1 本の接続。どのアカウントで送ったかと、最後に通信した時刻を持つ。"""
+
+    def __init__(self, client, upstream):
+        self.client, self.upstream = client, upstream
+        self.slug = None           # None = メインのまま
+        self.used = False          # /backend-api/codex/ のリクエストを通したか
+        self.awaiting = False      # 差し替えたリクエストの応答待ち
+        self.last = now()
+
+    def close(self) -> None:
+        _relay_close(self.client)
+        _relay_close(self.upstream)
+
+
+def codex_rewrite_head(head: bytes, auth: CodexRelayAuth, conn: CodexConn) -> tuple[bytes, dict, bool]:
+    """Host を chatgpt.com に直し、会話のリクエストなら認証を予備のものに差し替える。"""
+    lines = head.decode("latin-1").split("\r\n")
+    path = (lines[0].split(" ") + ["", ""])[1]
+    hdr = {}
+    for ln in lines[1:]:
+        if ":" in ln:
+            k, v = ln.split(":", 1)
+            hdr[k.strip().lower()] = v.strip()
+    swap = None
+    if path.startswith(CODEX_RELAY_PREFIX + "/"):
+        conn.used = True
+        bearer = hdr.get("authorization", "")
+        bearer = bearer[7:] if bearer.lower().startswith("bearer ") else None
+        swap = auth.replacement(hdr.get("chatgpt-account-id"), bearer)
+    for i, ln in enumerate(lines):
+        if not i or ":" not in ln:
+            continue
+        key = ln.split(":", 1)[0].strip().lower()
+        if key == "host":
+            lines[i] = f"Host: {CODEX_UPSTREAM}"
+        elif swap and key == "authorization":
+            lines[i] = f"Authorization: Bearer {swap[1]}"
+        elif swap and key == "chatgpt-account-id":
+            lines[i] = f"ChatGPT-Account-Id: {swap[2]}"
+    if conn.used:
+        conn.slug = swap[0] if swap else None
+        conn.awaiting = bool(swap)
+    conn.last = now()
+    return "\r\n".join(lines).encode("latin-1"), hdr, bool(swap)
+
+
+def codex_back_pipe(upstream, client, conn: CodexConn, auth: CodexRelayAuth) -> None:
+    """上流→Codex。中身は変えない。差し替えた直後の応答が 401/403 なら、その予備を外す。"""
+    try:
+        while True:
+            data = upstream.recv(65536)
+            if not data:
+                break
+            conn.last = now()
+            if conn.awaiting and data.startswith(b"HTTP/1."):
+                conn.awaiting = False
+                try:
+                    status = int(data[9:12])
+                except ValueError:
+                    status = 0
+                if status in (401, 403) and conn.slug:
+                    auth.mark_failed(conn.slug, status)
+            client.sendall(data)
+    except (OSError, ValueError):
+        pass
+    finally:
+        for s in (upstream, client):
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+
+class CodexRelayServer(RelayServer):
+    """平文 HTTP で受けて chatgpt.com へ TLS で送り直す（CONNECT は使わない）。"""
+
+    def __init__(self, port: int, auth: CodexRelayAuth | None = None):
+        super().__init__(port)
+        self.auth = auth or CodexRelayAuth()
+        self.conns = set()
+        self._conns_lock = threading.Lock()
+
+    def server_ctx(self):
+        return None                # 証明書は使わない
+
+    def start(self) -> None:
+        super().start()
+        threading.Thread(target=self._sweep_loop, name="mag-relay-codex-sweep", daemon=True).start()
+
+    def _sweep_loop(self) -> None:
+        while self.alive():
+            time.sleep(1.0)
+            self.sweep()
+
+    def sweep(self) -> None:
+        """枠の持ち主が変わったら、前の持ち主で張った接続を、静かになった時点で閉じる。
+
+        Codex は会話を WebSocket 1 本で続けるので、閉じないと切り替えが効かない。
+        閉じれば Codex が張り直し、その時点の持ち主で送り直す。
+        """
+        want = self.auth.paying()
+        with self._conns_lock:
+            stale = [c for c in self.conns
+                     if c.used and c.slug != want and now() - c.last >= CODEX_IDLE_CLOSE]
+        for c in stale:
+            log(f"relay(codex): 枠の持ち主が変わったので接続を張り直させます（{c.slug or 'main'} → {want or 'main'}）")
+            c.close()
+
+    def connect_upstream(self):
+        raw = socket.create_connection((CODEX_UPSTREAM, 443), timeout=30)
+        try:
+            ctx = ssl.create_default_context()
+            ctx.set_alpn_protocols(["http/1.1"])
+            return ctx.wrap_socket(raw, server_hostname=CODEX_UPSTREAM)
+        except Exception:
+            raw.close()
+            raise
+
+    def _handle(self, client, addr) -> None:
+        upstream = conn = None
+        try:
+            client.settimeout(30)
+            try:
+                upstream = self.connect_upstream()
+            except (OSError, ssl.SSLError):
+                client.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                return
+            client.settimeout(None)
+            upstream.settimeout(None)
+            conn = CodexConn(client, upstream)
+            with self._conns_lock:
+                self.conns.add(conn)
+            back = threading.Thread(target=codex_back_pipe, args=(upstream, client, conn, self.auth), daemon=True)
+            back.start()
+            relay_forward_requests(client, upstream, self.auth,
+                                   rewrite=lambda head: codex_rewrite_head(head, self.auth, conn))
+            back.join(30)
+        except (OSError, EOFError, ValueError, ssl.SSLError):
+            pass
+        except Exception as e:
+            log(f"relay(codex): 接続処理エラー: {type(e).__name__}: {e}")
+        finally:
+            if conn:
+                with self._conns_lock:
+                    self.conns.discard(conn)
+            _relay_close(client)
+            _relay_close(upstream)
+
+
+def codex_relay_listening(timeout: float = 1.0) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", codex_relay_port()), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+# ── Codex の設定（config.toml の openai_base_url） ──
+def codex_config_path() -> str:
+    return os.path.join(os.path.dirname(CODEX_AUTH_PATH), "config.toml")
+
+
+def _codex_top_level_lines(text: str) -> list:
+    """最初のテーブル見出し（[...]）より前の行。TOML の最上位キーはここにしか書けない。"""
+    out = []
+    for ln in text.splitlines():
+        if ln.lstrip().startswith("["):
+            break
+        out.append(ln)
+    return out
+
+
+def codex_config_conflict() -> str | None:
+    """自分以外が openai_base_url を設定していれば、その内容。"""
+    path = codex_config_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except FileNotFoundError:
+        text = ""
+    for ln in _codex_top_level_lines(text):
+        if re.match(r"\s*openai_base_url\s*=", ln) and codex_relay_url() not in ln:
+            return f"{path}: {ln.strip()}"
+    if os.environ.get("OPENAI_BASE_URL"):
+        return "OPENAI_BASE_URL"
+    return None
+
+
+def codex_config_installed() -> bool:
+    try:
+        with open(codex_config_path(), encoding="utf-8") as f:
+            text = f.read()
+    except FileNotFoundError:
+        return False
+    return any(re.match(r"\s*openai_base_url\s*=", ln) and codex_relay_url() in ln
+               for ln in _codex_top_level_lines(text))
+
+
+def codex_config_apply(enable: bool) -> None:
+    """config.toml の先頭に 1 行足す／自分が足した行だけ消す（元はバックアップ）。"""
+    path = codex_config_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except FileNotFoundError:
+        text = None
+    lines = (text or "").splitlines(keepends=True)
+    ours = re.compile(r"\s*openai_base_url\s*=\s*\"http://127\.0\.0\.1:\d+" + re.escape(CODEX_RELAY_PREFIX) + r"\"")
+    kept = [ln for ln in lines if ln.strip() != CODEX_RELAY_MARK and not ours.match(ln)]
+    if enable:
+        new = [CODEX_RELAY_MARK + "\n", f'openai_base_url = "{codex_relay_url()}"\n'] + kept
+    else:
+        new = kept
+    if new == lines:
+        return
+    if text is not None:
+        backup = path + f".bak.{time.time_ns()}"
+        shutil.copy2(path, backup)
+        print(T(f"backup: {backup}", f"バックアップ: {backup}"))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".mag.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("".join(new))
+    if text is not None:
+        shutil.copymode(path, tmp)
+    os.replace(tmp, path)
+
+
+def codex_install_main_login() -> str | None:
+    """auth.json（Codex のログイン）をメインにする。失敗理由を返す。"""
+    main = main_slug("codex")
+    if not main:
+        return T("no main account", "メインアカウントが未設定です")
+    with codex_auth_lock():
+        codex_sync_live()
+        live_id = codex_account_id(codex_live_auth())
+        if live_id and live_id == codex_account_id(codex_stored_auth(main)):
+            return None
+        auth, dead, checked = codex_fresh_locked(main, verify=True)
+        if dead or not auth:
+            return dead or T("no stored credential", "認証情報がありません")
+        if not checked:
+            return T("could not confirm the credential is valid (network error)",
+                     "認証情報が有効か確認できません（ネットワークエラー）")
+        try:
+            codex_install_auth(auth)
+        except (RuntimeError, OSError) as e:
+            return str(e)
+    log(f"relay(codex): ログインをメイン {main} にしました")
+    codex_apply_selection()          # 共有サーバーにも、再起動なしでメインを渡す
+    return None
+
+
+def codex_relay_turn_on() -> int:
+    """Codex の中継を ON にする（何度呼んでもよい）。`mag main` からも呼ばれる。"""
+    if IS_WINDOWS:
+        print(T("✗ the Codex relay is not supported on Windows yet", "✗ Codex の中継は Windows ではまだ使えません"),
+              file=sys.stderr)
+        return 1
+    main = main_slug("codex")
+    if not main:
+        print(T("✗ choose the main Codex account first: `mag main ALIAS`",
+                "✗ 先に Codex のメインアカウントを決めてください: `mag main ALIAS`"), file=sys.stderr)
+        return 1
+    if conflict := codex_config_conflict():
+        print(T(f"✗ Codex already has its own server address ({conflict}); the relay cannot replace it",
+                f"✗ Codex に別の接続先が設定済みです（{conflict}）。中継はこれと併用できません"), file=sys.stderr)
+        return 1
+    set_codex_relay_enabled(True)       # 先に立てる: ログインを入れ替えても「使う枠」は動かさない
+    err = codex_install_main_login()
+    if err:
+        set_codex_relay_enabled(False)
+        print(T(f"✗ could not sign Codex in to the main account: {err}",
+                f"✗ Codex のログインをメインにできませんでした: {err}"), file=sys.stderr)
+        return 1
+    try:
+        codex_config_apply(True)
+    except OSError as e:
+        set_codex_relay_enabled(False)
+        print(T(f"✗ could not update the Codex settings: {e}", f"✗ Codex の設定を更新できません: {e}"), file=sys.stderr)
+        return 1
+    print(T(f"✓ Codex relay on: Codex stays signed in to {describe(find_account(main))};"
+            f" usage is charged to {label_of(get_current('codex'))}",
+            f"✓ Codex の中継 ON: Codex のログインは {describe(find_account(main))} のまま、"
+            f"利用枠は {label_of(get_current('codex'))} から使います"))
+    print(T("  Remote control, Cloud tasks and plugins stay on the main account.",
+            "  リモート操作・Cloud タスク・プラグインはメインに残ります。"))
+    if watch_daemon_state() != T("running", "稼働中"):
+        print(T("  ⚠ the relay runs inside `mag watch`. Start it (or enable the background service);"
+                " until then new Codex conversations cannot connect.",
+                "  ⚠ 中継は `mag watch` の中で動きます。起動してください（常駐サービス推奨）。"
+                "起動するまで新しい Codex の会話は接続できません。"))
+    print(T("  Restart Codex (the app, open sessions and its background server) to use the relay;"
+            " until then they keep using the main account's usage.",
+            "  Codex（アプリ・開いているセッション・常駐サーバー）を再起動すると中継を使います。"
+            "それまではメインの枠を使います。"))
+    return 0
+
+
+def codex_relay_turn_off() -> int:
+    if not codex_relay_enabled() and not codex_config_installed():
+        print(T("Codex relay is already off", "Codex の中継はすでに OFF です"))
+        return 0
+    try:
+        codex_config_apply(False)
+    except OSError as e:
+        print(T(f"✗ could not update the Codex settings: {e}", f"✗ Codex の設定を更新できません: {e}"), file=sys.stderr)
+        return 1
+    set_codex_relay_enabled(False)
+    main = main_slug("codex")
+    if main:
+        set_current("codex", main)      # ログイン＝メインが、そのまま使う枠になる
+    print(T("✓ Codex relay off. Restart Codex so it stops using the relay.",
+            "✓ Codex の中継 OFF。Codex を再起動してください。"))
+    return 0
 
 
 # ── Claude Code の設定（settings.json の env） ──
@@ -4480,6 +5041,20 @@ def cmd_doctor(args) -> int:
         ident = codex_identity(cauth) if cauth else {}
         print(T(f"codex account      : {ident.get('email') or 'not signed in'} ({ident.get('plan') or '?'})",
                 f"codex アカウント   : {ident.get('email') or '未ログイン'} ({ident.get('plan') or '?'})"))
+        if codex_relay_enabled():
+            cmain = main_slug("codex")
+            listening, wired = codex_relay_listening(), codex_config_installed()
+            signed_main = bool(cmain and codex_account_id(cauth) == codex_account_id(codex_stored_auth(cmain)))
+            print(T(f"codex relay        : on — login {label_of(cmain)}, usage {label_of(get_current('codex'))}",
+                    f"Codex の中継       : ON — ログイン {label_of(cmain)}、利用枠 {label_of(get_current('codex'))}"))
+            print(T(f"  listening        : {'OK' if listening else 'NO — Codex cannot connect (is mag watch running?)'}",
+                    f"  待ち受け         : {'OK' if listening else 'なし — Codex が接続できません（mag watch は動いていますか）'}"))
+            print(T(f"  config.toml      : {'OK' if wired else 'missing — run `mag relay on codex`'}",
+                    f"  config.toml      : {'OK' if wired else 'なし — `mag relay on codex` を再実行'}"))
+            if not signed_main:
+                print(T("  ⚠ Codex is not signed in to the main account — run `mag relay on codex` again",
+                        "  ⚠ Codex のログインがメインではありません — `mag relay on codex` を再実行"))
+            ok &= listening and wired and signed_main
     hooked = False
     for fn in ("statusline-command.sh", "statusline-command.cmd"):
         p_ = os.path.join(claude_config_dir(), fn)
@@ -4774,6 +5349,8 @@ Registering (the alias is what you type from then on):
     a = sub.add_parser("relay", help=T("status of the relay `mag main` turns on; `off` goes back to swapping logins",
                                        "`mag main` で ON になる中継の状態。`off` で従来のログイン入れ替えに戻す"))
     a.add_argument("action", nargs="?", choices=["on", "off", "status", "serve"])
+    a.add_argument("provider", nargs="?", choices=["claude", "codex"],
+                   help=T("only this one (default: both)", "片方だけ（省略時は両方）"))
     a.set_defaults(func=cmd_relay)
 
     a = sub.add_parser("status", aliases=["st"], help=T("per-account detail","アカウントごとの詳細"))

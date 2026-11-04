@@ -41,6 +41,14 @@ read it can impersonate `api.anthropic.com` to programs that trust this CA. Only
 connections from the Claude Code program are decrypted; the relay replaces the
 `Authorization` header of conversation requests and logs no request content.
 
+Setting a Codex main account adds `openai_base_url` to Codex's `config.toml`, pointing
+Codex's conversation traffic at a plain-HTTP listener on `127.0.0.1`, which forwards it
+to `chatgpt.com` over verified HTTPS. No certificate is involved. Conversation requests
+carrying the main account's own access token (the one in `auth.json`) may be re-sent with
+a spare account's access token and account ID; a request without that token is forwarded
+unchanged, so a local process cannot borrow a spare without the main login. Nothing else
+is changed and no request content is logged.
+
 ## Communications
 
 The Python implementation calls Anthropic usage/profile and OAuth endpoints and OpenAI's

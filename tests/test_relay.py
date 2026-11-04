@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 from test_mag import Base, mag
 
@@ -43,6 +44,139 @@ class RelayBase(Base):
     def head(self, method="POST", path="/v1/messages?beta=true", token="sk-ant-oat-main", extra=""):
         return (f"{method} {path} HTTP/1.1\r\nHost: api.anthropic.com\r\n"
                 f"Authorization: Bearer {token}\r\n{extra}\r\n").encode()
+
+
+class RelayLifecycle(Base):
+    def server(self):
+        srv = mag.RelayServer(0)
+        srv.server_ctx = lambda: None
+        self.addCleanup(srv.stop)
+        return srv
+
+    def test_stop_releases_port_and_accept_thread(self):
+        srv = self.server()
+        srv.start()
+        port = srv.sock.getsockname()[1]
+        thread = srv.thread
+        srv.stop()
+        thread.join(2)
+        self.assertFalse(thread.is_alive())
+        with socket.socket() as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            probe.bind(("127.0.0.1", port))
+
+    def test_failed_start_releases_port(self):
+        srv = self.server()
+        listener = socket.socket()
+        self.addCleanup(listener.close)
+        with mock.patch.object(mag.socket, "socket", return_value=listener):
+            with mock.patch.object(srv, "server_ctx", side_effect=ValueError("bad cert")):
+                with self.assertRaises(ValueError):
+                    srv.start()
+        self.assertEqual(listener.fileno(), -1)
+
+    def test_supervisor_releases_dead_listener_before_restarting(self):
+        stale = self.server()
+        stale.sock = socket.socket()
+        stale.sock.bind(("127.0.0.1", 0))
+        stale.sock.listen()
+        port = stale.sock.getsockname()[1]
+        replacement = self.server()
+        replacement.port = port
+        self.patch("_RELAY_SERVERS", {"claude": stale})
+        self.patch("_RELAY_FAIL_AT", {})
+        self.patch("relay_enabled", lambda: True)
+        self.patch("codex_relay_enabled", lambda: False)
+        self.patch("relay_port", lambda: port)
+        self.patch("notify", lambda *args: None)
+        with mock.patch.object(mag, "RelayServer", return_value=replacement):
+            mag.relay_supervise()
+        self.assertIs(mag._RELAY_SERVERS["claude"], replacement)
+        self.assertTrue(replacement.alive())
+
+    def test_accept_error_releases_port(self):
+        srv = self.server()
+        listener = socket.socket()
+        self.addCleanup(listener.close)
+        wrapped = mock.Mock(wraps=listener)
+        wrapped.accept.side_effect = OSError(24, "Too many open files")
+        with mock.patch.object(mag.socket, "socket", return_value=wrapped):
+            srv.start()
+        srv.thread.join(2)
+        self.assertFalse(srv.alive())
+        self.assertEqual(listener.fileno(), -1)
+
+    def test_failed_connect_reply_closes_upstream(self):
+        srv = self.server()
+        client, peer = socket.socketpair()
+        upstream, upstream_peer = socket.socketpair()
+        for sock in (client, peer, upstream, upstream_peer):
+            self.addCleanup(sock.close)
+        peer.close()
+        with mock.patch.object(mag, "_recv_head", return_value=(b"CONNECT example.test:443 HTTP/1.1\r\n\r\n", b"")):
+            with mock.patch.object(mag.socket, "create_connection", return_value=upstream):
+                srv._handle(client, ("127.0.0.1", 12345))
+        self.assertEqual(client.fileno(), -1)
+        self.assertEqual(upstream.fileno(), -1)
+
+    def test_connection_limit_queues_then_serves_next_client(self):
+        with mock.patch.object(mag.RelayServer, "MAX_CONNECTIONS", 2):
+            srv = self.server()
+        entered = threading.Event()
+        count = []
+        handle = srv._handle
+
+        def tracked_handle(client, addr):
+            count.append(addr)
+            if len(count) == 2:
+                entered.set()
+            handle(client, addr)
+
+        srv._handle = tracked_handle
+        srv.start()
+        addr = srv.sock.getsockname()
+        first = socket.create_connection(addr, timeout=2)
+        second = socket.create_connection(addr, timeout=2)
+        third = socket.create_connection(addr, timeout=2)
+        for sock in (first, second, third):
+            self.addCleanup(sock.close)
+        self.assertTrue(entered.wait(2))
+        third.sendall(b"GET / HTTP/1.1\r\n\r\n")
+        third.settimeout(0.1)
+        with self.assertRaises(socket.timeout):
+            third.recv(1024)
+        self.assertEqual(len(count), 2)
+        first.close()
+        third.settimeout(2)
+        self.assertIn(b"405 Method Not Allowed", third.recv(1024))
+
+    def test_intercept_disconnect_unblocks_upstream_reader(self):
+        srv = self.server()
+        client, client_peer = socket.socketpair()
+        upstream, upstream_peer = socket.socketpair()
+        for sock in (client, client_peer, upstream, upstream_peer):
+            self.addCleanup(sock.close)
+        reader_done = threading.Event()
+        original_pipe = mag._pipe
+
+        def pipe(src, dst):
+            try:
+                original_pipe(src, dst)
+            finally:
+                reader_done.set()
+
+        ctx = mock.Mock()
+        ctx.wrap_socket.side_effect = lambda sock, **kw: sock
+        srv.server_ctx = lambda: ctx
+        with mock.patch.object(mag.ssl, "create_default_context", return_value=ctx):
+            with mock.patch.object(mag, "relay_forward_requests", return_value=None):
+                with mock.patch.object(mag, "_pipe", side_effect=pipe):
+                    srv._intercept(client, upstream, b"")
+                    finished = reader_done.wait(1)
+                    # Also clean up a blocked reader when testing the broken implementation.
+                    upstream_peer.close()
+                    reader_done.wait(1)
+        self.assertTrue(finished, "disconnected client left the upstream reader blocked")
 
 
 class SwapDecision(RelayBase):

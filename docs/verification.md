@@ -1,6 +1,28 @@
 # Compatibility and verification
 
-Verification date: **2026-11-03**. Release: **v0.1.3** (early release).
+Verification date: **2026-11-04**. Release: **v0.1.4** (early release).
+
+## v0.1.4
+
+`mag main CODEX_ALIAS` now keeps Codex signed in to the main account and moves only
+whose usage conversations spend, through `openai_base_url` and a local plain-HTTP relay.
+
+- All 237 regression tests passed locally on macOS with Python 3.14 and with the
+  monitor's Python 3.9.6, together with the offline CLI walkthrough and syntax checks.
+- Tests cover which requests are re-signed (conversation paths carrying the main login's
+  own token and account ID), fallback to the main account after a 401/403, closing quiet
+  connections that belong to the previous account, end-to-end forwarding with a stand-in
+  upstream, `config.toml` add/remove/conflict handling, switching without touching
+  `auth.json`, and a single refresh when several requests renew a spare at once.
+- On a real macOS installation with **Codex CLI 0.166.0**, `codex exec` through the relay
+  answered on the main account, failed with the spare workspace's spend-cap error after
+  `mag use` selected the spare, and answered again after switching back. In one open
+  interactive session the same sequence happened across three turns without a restart;
+  `/status` kept showing the main account. `auth.json` was unchanged throughout.
+- An earlier probe showed the server's rate-limit events reporting the spare's windows
+  and the spare's five-hour window starting while the main account's usage did not move.
+- Not tested: the Codex desktop app and the shared `codex app-server` with Remote Control
+  after a restart (their traffic paths match the CLI's), Linux, and Windows (unsupported).
 
 ## v0.1.3
 

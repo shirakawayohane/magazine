@@ -31,6 +31,8 @@ class Fixture(Base):
         self.relay_calls = []                          # `mag main` turns the relay on; tested in test_relay
         self.patch("relay_turn_on", lambda: self.relay_calls.append("on") or 0)
         self.patch("relay_turn_off", lambda: self.relay_calls.append("off") or 0)
+        self.patch("codex_relay_turn_on", lambda: self.relay_calls.append("codex-on") or 0)
+        self.patch("codex_relay_turn_off", lambda: self.relay_calls.append("codex-off") or 0)
         self.patch("reconcile_current", lambda: {})
         self.patch("mark_watch_alive", lambda **kw: None)
         self.patch("notify", lambda *args: None)
