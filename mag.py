@@ -226,7 +226,15 @@ def write_json(path: str, data) -> None:
             json.dump(data, f, indent=2, ensure_ascii=False)
         if os.path.exists(path):
             shutil.copymode(path, tmp)
-        os.replace(tmp, path)
+        for attempt in range(6):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError as e:
+                # A concurrent open or rename can temporarily deny replacement on Windows.
+                if not IS_WINDOWS or getattr(e, "winerror", None) not in (5, 32) or attempt == 5:
+                    raise
+                time.sleep(0.01 * (2 ** attempt))
     finally:
         with contextlib.suppress(FileNotFoundError):
             os.unlink(tmp)

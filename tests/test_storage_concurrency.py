@@ -28,10 +28,13 @@ class ConcurrentStorage(Base):
     def test_simultaneous_atomic_writers_use_independent_files(self):
         path = os.path.join(mag.ROOT, "update.json")
         barrier = threading.Barrier(8)
+        synchronized = threading.local()
         replace = mag.os.replace
 
         def synchronized_replace(source, target):
-            barrier.wait(timeout=5)
+            if not getattr(synchronized, "started", False):
+                synchronized.started = True
+                barrier.wait(timeout=5)
             replace(source, target)
 
         with mock.patch.object(mag.os, "replace", side_effect=synchronized_replace):
@@ -39,6 +42,18 @@ class ConcurrentStorage(Base):
                 list(pool.map(lambda n: mag.write_json(path, {"writer": n}), range(8)))
         self.assertIn(mag.read_json(path, {})["writer"], range(8))
         self.assertFalse(any(name.startswith("update.json.") for name in os.listdir(mag.ROOT)))
+
+    def test_windows_sharing_violation_retries_atomic_replace(self):
+        path = os.path.join(mag.ROOT, "config.json")
+        mag.write_json(path, {"original": True})
+        replace = mag.os.replace
+        busy = PermissionError("temporary sharing violation")
+        busy.winerror = 32
+        self.patch("IS_WINDOWS", True)
+        with mock.patch.object(mag.os, "replace", wraps=replace, side_effect=[busy, mock.DEFAULT]) as move:
+            mag.write_json(path, {"updated": True})
+        self.assertEqual(move.call_count, 2)
+        self.assertEqual(mag.read_json(path, {}), {"updated": True})
 
     def test_parallel_limit_updates_preserve_selection_and_every_account(self):
         mag.set_current("claude", "main", manual=True)
