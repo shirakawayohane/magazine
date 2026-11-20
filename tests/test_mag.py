@@ -57,6 +57,10 @@ class Base(unittest.TestCase):
         self.addCleanup(home.cleanup)
         self.patch("CODEX_AUTH_PATH", os.path.join(home.name, "auth.json"))
         self.patch("codex_apply_selection", lambda: True)
+        # Service control is tested separately; unit tests never install a real daemon.
+        self.patch("relay_ensure_running", lambda prov: None)
+        self.patch("relay_prepare_switch", lambda prov, **kwargs: True)
+        self.patch("relay_stop_if_unused", lambda prov, operation: None)
         # Claude Code の本物の設定（~/.claude/settings.json）には決して触れない
         claude_home = os.path.join(home.name, "claude")
         os.makedirs(claude_home, exist_ok=True)

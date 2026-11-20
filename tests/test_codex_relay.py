@@ -204,6 +204,16 @@ class Switching(CodexBase):
         mag.reconcile_current()
         self.assertEqual(mag.get_current("codex"), "cx-spare")
 
+    def test_start_failure_does_not_install_the_proxy_or_change_login(self):
+        mag.set_codex_relay_enabled(False)
+        self.patch("relay_ensure_running", lambda prov: "listener failed")
+        self.patch("sync_live_credentials", lambda: None)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(mag.codex_relay_turn_on(), 1)
+        self.assertFalse(mag.codex_relay_enabled())
+        self.assertFalse(mag.codex_config_installed())
+        self.assertEqual(self.installed, [])
+
     def test_choosing_main_turns_the_relay_on_and_clear_turns_it_off(self):
         mag.set_codex_relay_enabled(False)
         mag.set_main(None, "codex")

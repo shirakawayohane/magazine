@@ -306,6 +306,16 @@ class PeerDetection(Base):
 
 
 class Switching(RelayBase):
+    def test_hotswap_does_not_report_success_when_activation_fails(self):
+        self.patch("set_cooldown_verified", lambda *args, **kwargs: True)
+        self.patch("next_slug", lambda *args, **kwargs: ("main", []))
+        self.patch("do_load", lambda *args: False)
+        reported = []
+        self.patch("notify", lambda *args: reported.append(args))
+        self.assertFalse(mag.hotswap("seven_day", "weekly limit"))
+        self.assertEqual(mag.get_current("claude"), "spare")
+        self.assertEqual(reported, [])
+
     def test_switch_changes_usage_not_login(self):
         self.assertTrue(mag.do_load("main", "next"))
         self.assertTrue(mag.do_load("spare", "next"))
@@ -439,6 +449,8 @@ class OnOff(RelayBase):
             return mag.cmd_relay(argparse.Namespace(action=action))
 
     def test_on_signs_in_to_main_and_keeps_the_paying_choice(self):
+        records = []
+        self.patch("log", records.append)
         mag.set_current("claude", "spare", manual=True)
         self.assertEqual(self.relay("on"), 0)
         self.assertEqual(self.live["accessToken"], "sk-ant-oat-main")
@@ -448,7 +460,52 @@ class OnOff(RelayBase):
         self.assertEqual(self.relay("off"), 0)
         self.assertFalse(mag.relay_enabled())
         self.assertFalse(mag.relay_settings_installed())
+        self.assertEqual(self.live["accessToken"], "sk-ant-oat-spare")
+        self.assertEqual(mag.get_current("claude"), "spare")
+        self.assertTrue(mag.manually_selected("spare"))
+        self.assertTrue(any("provider=claude operation='mag relay off' step=disable result=ok" in row
+                            for row in records))
+
+    def test_off_reports_when_the_paying_account_cannot_be_installed(self):
+        self.assertEqual(self.relay("on"), 0)
+        self.store.pop("spare")
+        self.assertEqual(self.relay("off"), 1)
+        self.assertFalse(mag.relay_enabled())
+        self.assertFalse(mag.relay_settings_installed())
+        self.assertEqual(self.live["accessToken"], "sk-ant-oat-main")
         self.assertEqual(mag.get_current("claude"), "main")
+
+    def test_service_failure_keeps_login_and_removes_proxy(self):
+        original = dict(self.live)
+        self.patch("relay_ensure_running", lambda prov: "listener failed")
+        self.assertEqual(self.relay("on"), 1)
+        self.assertFalse(mag.relay_enabled())
+        self.assertFalse(mag.relay_settings_installed())
+        self.assertEqual(self.live, original)
+        self.assertEqual(self.installed, [])
+
+    def test_repair_failure_removes_previously_installed_proxy(self):
+        self.assertEqual(self.relay("on"), 0)
+        self.patch("relay_ensure_running", lambda prov: "synthetic-sensitive-service-error")
+        records = []
+        self.patch("log", records.append)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(mag.relay_turn_on(operation="mag use repair"), 1)
+        self.assertFalse(mag.relay_enabled())
+        self.assertFalse(mag.relay_settings_installed())
+        self.assertEqual(mag.get_current("claude"), "main")
+        self.assertTrue(any("operation='mag use repair' step=service_start result=RuntimeError" in row
+                            for row in records))
+        self.assertTrue(any("operation='mag use repair' step=disable result=rollback" in row
+                            for row in records))
+        self.assertNotIn("synthetic-sensitive-service-error", "\n".join(records))
+
+    def test_login_failure_removes_previously_installed_proxy(self):
+        self.assertEqual(self.relay("on"), 0)
+        self.patch("install_main_login", lambda: "credential unavailable")
+        self.assertEqual(self.relay("on"), 1)
+        self.assertFalse(mag.relay_enabled())
+        self.assertFalse(mag.relay_settings_installed())
 
     def main_cmd(self, name=None, provider=None):
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
@@ -463,11 +520,14 @@ class OnOff(RelayBase):
         self.assertEqual(mag.get_current("claude"), "spare")      # usage stays where it was
 
     def test_clearing_main_turns_the_relay_off(self):
+        records = []
+        self.patch("log", records.append)
         self.assertEqual(self.main_cmd("main"), 0)
         self.assertEqual(self.main_cmd("clear"), 0)
         self.assertFalse(mag.relay_enabled())
         self.assertFalse(mag.relay_settings_installed())
         self.assertIsNone(mag.main_slug("claude"))
+        self.assertTrue(any("operation='mag main clear' step=disable result=ok" in row for row in records))
 
     def test_main_is_kept_when_the_relay_cannot_start(self):
         mag.set_main(None, "claude")

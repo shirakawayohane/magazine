@@ -17,21 +17,11 @@ function _magazine_has_accounts
 end
 
 function claude --description 'claude (magazine: pick an account first)'
-    if not _magazine_has_accounts
+    if _magazine_has_accounts; and command -q mag
+        command mag _claude-launch $argv
+    else
         command claude $argv
-        return $status
     end
-
-    # 認証・管理系は素通し（claude auth login はブラウザ認証を伴う）
-    if contains -- "$argv[1]" auth mcp plugin plugins install update upgrade doctor setup-token agents project gateway ultrareview
-        command claude $argv
-        return $status
-    end
-
-    # ネットワークを叩かずローカルの状態だけで判断する（起動を遅らせない）
-    command mag auto --no-probe >/dev/null 2>&1
-    command claude $argv
-    return $status
 end
 
 function codex --description 'codex (magazine: pick an account first)'

@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import functools
 import hashlib
 import json
 import os
@@ -40,6 +41,7 @@ import ssl
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unicodedata
@@ -48,7 +50,7 @@ import urllib.request
 import uuid
 from datetime import datetime, timedelta, timezone
 
-VERSION = "0.1.4"
+VERSION = "0.1.5"
 
 HOME = os.path.expanduser("~")
 
@@ -217,10 +219,17 @@ def read_json(path: str, default):
 
 def write_json(path: str, data) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-    os.replace(tmp, path)
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp",
+                               dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        if os.path.exists(path):
+            shutil.copymode(path, tmp)
+        os.replace(tmp, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp)
 
 
 def config() -> dict:
@@ -243,6 +252,35 @@ def state() -> dict:
 
 def save_state(s: dict) -> None:
     write_json(STATE_PATH, s)
+
+
+@contextlib.contextmanager
+def edit_state():
+    """Keep read/modify/write together so other commands cannot erase updates."""
+    with file_lock(STATE_PATH + ".lock"):
+        s = state()
+        before = json.dumps(s, sort_keys=True)
+        yield s
+        if json.dumps(s, sort_keys=True) != before:
+            save_state(s)
+
+
+_RELAY_CHANGE = threading.local()
+
+
+def serialized_relay_change(fn):
+    """Order relay setup before credential locks, including nested switch calls."""
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        if getattr(_RELAY_CHANGE, "held", False):
+            return fn(*args, **kwargs)
+        with file_lock(os.path.join(ROOT, "locks", "relay-setup.lock")):
+            _RELAY_CHANGE.held = True
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                _RELAY_CHANGE.held = False
+    return wrapped
 
 
 def parse_iso(ts) -> float | None:
@@ -1689,24 +1727,23 @@ def get_current(provider: str) -> str | None:
 
 
 def set_current(provider: str, slug: str, *, manual: bool = False) -> None:
-    s = state()
-    cur = s.get("current")
-    if not isinstance(cur, dict):
-        cur = {"claude": cur} if cur else {}
-    # Reaffirming the same selection must not discard its active session readings.
-    if not manual or cur.get(provider) != slug:
-        s.setdefault("last_switch_by", {})[provider] = now()
-        s["last_switch"] = now()
-    cur[provider] = slug
-    s["current"] = cur
-    selected = s.setdefault("manual_selection", {})
-    if manual:
-        selected[provider] = slug
-        # A deliberate retry supersedes an earlier (possibly preventive) cooldown.
-        s.setdefault("cooldowns", {}).pop(slug, None)
-    else:
-        selected.pop(provider, None)
-    save_state(s)
+    with edit_state() as s:
+        cur = s.get("current")
+        if not isinstance(cur, dict):
+            cur = {"claude": cur} if cur else {}
+        # Reaffirming the same selection must not discard its active session readings.
+        if not manual or cur.get(provider) != slug:
+            s.setdefault("last_switch_by", {})[provider] = now()
+            s["last_switch"] = now()
+        cur[provider] = slug
+        s["current"] = cur
+        selected = s.setdefault("manual_selection", {})
+        if manual:
+            selected[provider] = slug
+            # A deliberate retry supersedes an earlier (possibly preventive) cooldown.
+            s.setdefault("cooldowns", {}).pop(slug, None)
+        else:
+            selected.pop(provider, None)
 
 
 def manually_selected(slug: str | None, provider: str = "claude") -> bool:
@@ -1813,9 +1850,8 @@ def identify_claude_token(token: str) -> str | None:
         return None
     email = ((d or {}).get("account") or {}).get("email")
     if email:
-        s = state()
-        s.setdefault("profile_cache", {})[key] = {"email": email, "ts": now()}
-        save_state(s)
+        with edit_state() as s:
+            s.setdefault("profile_cache", {})[key] = {"email": email, "ts": now()}
     return email
 
 
@@ -1839,11 +1875,10 @@ def sync_live_credentials() -> str | None:
     if not email:
         # 保管庫が現用より古いのに、持ち主を確認できない（圏外など）。
         # このまま切り替えると古いトークンを掴むので、気づけるように残す。
-        s = state()
-        if now() - float(s.get("sync_warned_at") or 0) > 600:
-            s["sync_warned_at"] = now()
-            save_state(s)
-            log("sync: 現用トークンの持ち主を確認できず、保管庫が古いままです（圏外?）")
+        with edit_state() as s:
+            if now() - float(s.get("sync_warned_at") or 0) > 600:
+                s["sync_warned_at"] = now()
+                log("sync: 現用トークンの持ち主を確認できず、保管庫が古いままです（圏外?）")
         return None
     for a in accounts_of("claude"):
         if (a.get("email") or "").lower() == email.lower():
@@ -1898,21 +1933,19 @@ def set_cooldown(slug: str, kind: str | None, resets_at: float | None) -> None:
     if not resets_at:
         span = cfg.get(f"fallback_cooldown_{kind}") or cfg["fallback_cooldown_five_hour"]
         resets_at = now() + span
-    s = state()
-    s.setdefault("cooldowns", {})[slug] = {
-        "until": resets_at, "kind": kind, "set_at": now(),
-    }
-    save_state(s)
+    with edit_state() as s:
+        s.setdefault("cooldowns", {})[slug] = {
+            "until": resets_at, "kind": kind, "set_at": now(),
+        }
     log(f"cooldown: {slug} kind={kind} until={datetime.fromtimestamp(resets_at):%m/%d %H:%M}")
 
 
 def clear_expired_cooldowns() -> None:
-    s = state()
-    cds = s.get("cooldowns") or {}
-    live = {k: v for k, v in cds.items() if float(v.get("until", 0)) > now()}
-    if len(live) != len(cds):
-        s["cooldowns"] = live
-        save_state(s)
+    with edit_state() as s:
+        cds = s.get("cooldowns") or {}
+        live = {k: v for k, v in cds.items() if float(v.get("until", 0)) > now()}
+        if len(live) != len(cds):
+            s["cooldowns"] = live
 
 
 def probe(slug: str, quiet: bool = True) -> dict:
@@ -1994,7 +2027,10 @@ def is_usable(slug: str, p: dict = None) -> tuple[bool, str]:
     return True, "ok"
 
 
+@serialized_relay_change
 def do_load(slug: str, reason: str = "") -> bool:
+    if not relay_prepare_switch(provider_of(find_account(slug) or {})):
+        return False
     if provider_of(find_account(slug) or {}) == "codex":
         with codex_auth_lock():
             ok = _do_load(slug, reason)
@@ -2490,10 +2526,10 @@ def cmd_main(args) -> int:
         provs = ("claude", "codex") if clear == "all" else (clear,)
         for prov in provs:
             if prov == "claude" and (relay_enabled() or relay_settings_installed()):
-                if relay_turn_off() != 0:          # 中継はメインが前提。先に止めて設定を戻す
+                if relay_turn_off(operation="mag main clear") != 0:
                     return 1
             if prov == "codex" and (codex_relay_enabled() or codex_config_installed()):
-                if codex_relay_turn_off() != 0:
+                if codex_relay_turn_off(operation="mag main clear") != 0:
                     return 1
             had = main_slug(prov)
             set_main(None, prov)
@@ -2524,7 +2560,8 @@ def cmd_main(args) -> int:
     if not IS_WINDOWS:
         # メインを決めたら中継も ON: ログインはメインに固定し、切り替えるのは利用枠だけにする
         app = "Claude Code" if prov == "claude" else "Codex"
-        if (relay_turn_on() if prov == "claude" else codex_relay_turn_on()) != 0:
+        enable = relay_turn_on if prov == "claude" else codex_relay_turn_on
+        if enable(operation="mag main") != 0:
             print(T(f"  The main account is set, but switching still replaces the {app} login."
                     f" Fix the problem above and run `mag relay on {prov}`.",
                     f"  メインは設定しましたが、切り替えは従来どおり {app} のログインを入れ替えます。"
@@ -2548,6 +2585,8 @@ def cmd_main(args) -> int:
 def cmd_relay(args) -> int:
     """利用枠だけを予備へ回す中継の on / off / status / serve。"""
     action = args.action or "status"
+    if action == "serve" and getattr(args, "provider", None) is None:
+        return relay_serve_forever()
     if action == "serve" and getattr(args, "provider", None) == "codex":
         srv = CodexRelayServer(codex_relay_port())
         srv.start()
@@ -2590,36 +2629,42 @@ def cmd_relay(args) -> int:
         return rc
 
     # status
+    rc = 0
     if "codex" in provs:
         con = codex_relay_enabled()
         print(T(f"Codex relay: {'on' if con else 'off'}", f"Codex の中継: {'ON' if con else 'OFF'}"))
         if con:
+            listening, wired = codex_relay_listening(), codex_config_installed()
+            rc |= int(not (main_slug("codex") and listening and wired))
             print(T(f"  login (remote control etc.): {label_of(main_slug('codex'))}   usage: {label_of(get_current('codex'))}",
                     f"  ログイン（リモート操作など）: {label_of(main_slug('codex'))}   利用枠: {label_of(get_current('codex'))}"))
-            print(T(f"  listening: {'yes' if codex_relay_listening() else 'NO — new Codex conversations cannot connect'}"
+            print(T(f"  listening: {'yes' if listening else 'NO — new Codex conversations cannot connect'}"
                     f" ({codex_relay_url()})",
-                    f"  待ち受け: {'OK' if codex_relay_listening() else 'なし — 新しい Codex の会話が接続できません'}"
+                    f"  待ち受け: {'OK' if listening else 'なし — 新しい Codex の会話が接続できません'}"
                     f" ({codex_relay_url()})"))
-            print(T(f"  Codex settings: {'ok' if codex_config_installed() else 'missing — run `mag relay on codex`'}",
-                    f"  Codex の設定: {'OK' if codex_config_installed() else 'なし — `mag relay on codex` を再実行'}"))
+            print(T(f"  Codex settings: {'ok' if wired else 'missing — run `mag relay on codex`'}",
+                    f"  Codex の設定: {'OK' if wired else 'なし — `mag relay on codex` を再実行'}"))
     if "claude" not in provs:
-        return 0
+        return rc
     on = relay_enabled()
     print(T(f"Claude relay: {'on' if on else 'off'}", f"Claude の中継: {'ON' if on else 'OFF'}"))
     if on:
+        listening, wired = relay_listening(), relay_settings_installed()
+        rc |= int(not (main_slug("claude") and listening and wired))
         print(T(f"  login (Artifacts etc.): {label_of(main_slug('claude'))}   usage: {label_of(get_current('claude'))}",
                 f"  ログイン（Artifact など）: {label_of(main_slug('claude'))}   利用枠: {label_of(get_current('claude'))}"))
-        print(T(f"  listening: {'yes' if relay_listening() else 'NO — Claude Code cannot connect'} ({relay_url()})",
-                f"  待ち受け: {'OK' if relay_listening() else 'なし — Claude Code が接続できません'} ({relay_url()})"))
-        print(T(f"  Claude Code settings: {'ok' if relay_settings_installed() else 'missing — run `mag relay on`'}",
-                f"  Claude Code の設定: {'OK' if relay_settings_installed() else 'なし — `mag relay on` を再実行'}"))
+        print(T(f"  listening: {'yes' if listening else 'NO — Claude Code cannot connect'} ({relay_url()})",
+                f"  待ち受け: {'OK' if listening else 'なし — Claude Code が接続できません'} ({relay_url()})"))
+        print(T(f"  Claude Code settings: {'ok' if wired else 'missing — run `mag relay on`'}",
+                f"  Claude Code の設定: {'OK' if wired else 'なし — `mag relay on` を再実行'}"))
     elif main_slug("claude"):
         print(T("  Switching replaces the Claude Code login. `mag relay on` keeps it on the main account.",
                 "  切り替えのたびに Claude Code のログインを入れ替えます。`mag relay on` でメインに固定できます。"))
-    return 0
+    return rc
 
 
-def relay_turn_on() -> int:
+@serialized_relay_change
+def relay_turn_on(*, operation: str = "mag relay on") -> int:
     """中継を ON にする（何度呼んでもよい）。`mag main` からも呼ばれる。"""
     if IS_WINDOWS:
         print(T("✗ the relay is not supported on Windows yet", "✗ 中継は Windows ではまだ使えません"), file=sys.stderr)
@@ -2637,20 +2682,26 @@ def relay_turn_on() -> int:
         if not relay_certs_ready():
             relay_make_certs()
     except (RuntimeError, OSError) as e:
+        relay_audit("claude", operation, "certificates", type(e).__name__)
         print(T(f"✗ could not create the relay certificate: {e}", f"✗ 中継用の証明書を作れません: {e}"), file=sys.stderr)
         return 1
     set_relay_enabled(True)        # 先に立てる: ログインを入れ替えても「使う枠」は動かさない
-    err = install_main_login()
-    if err:
-        set_relay_enabled(False)
-        print(T(f"✗ could not sign Claude Code in to the main account: {err}",
-                f"✗ Claude Code のログインをメインにできませんでした: {err}"), file=sys.stderr)
-        return 1
+    step = "service_start"
     try:
+        err = relay_ensure_running("claude")
+        if err:
+            raise RuntimeError(err)
+        step = "main_login"
+        err = install_main_login()
+        if err:
+            raise RuntimeError(err)
+        step = "apply_client_settings"
         relay_settings_apply(True)
     except (RuntimeError, OSError) as e:
-        set_relay_enabled(False)
-        print(T(f"✗ could not update Claude Code settings: {e}", f"✗ Claude Code の設定を更新できません: {e}"),
+        relay_audit("claude", operation, step, type(e).__name__)
+        relay_rollback("claude", operation)
+        reconcile_current()
+        print(T(f"✗ could not enable Claude Code relay: {e}", f"✗ Claude Code の中継を有効にできません: {e}"),
               file=sys.stderr)
         return 1
     print(T(f"✓ relay on: Claude Code stays signed in to {describe(find_account(main))};"
@@ -2659,38 +2710,48 @@ def relay_turn_on() -> int:
             f"利用枠は {label_of(get_current('claude'))} から使います"))
     print(T("  Artifacts, Remote Control and everything else stay on the main account.",
             "  Artifact・Remote Control などはすべてメインに残ります。"))
-    if watch_daemon_state() != T("running", "稼働中"):
-        print(T("  ⚠ the relay runs inside `mag watch`. Start it (or enable the background service);"
-                " until then Claude Code cannot connect.",
-                "  ⚠ 中継は `mag watch` の中で動きます。起動してください（常駐サービス推奨）。"
-                "起動するまで Claude Code は接続できません。"))
-    else:
-        print(T("  The background monitor starts the relay within about 20 seconds.",
-                "  常駐監視が 20 秒ほどで中継を起動します。"))
+    print(T("  Relay is running (restarts automatically).", "  中継は稼働中です（停止時は自動再起動）。"))
     print(T("  Restart Claude Code sessions that were already open; they keep using the main account's usage.",
             "  開いていた Claude Code のセッションは再起動してください（再起動まではメインの枠を使います）。"))
     return 0
 
 
-def relay_turn_off() -> int:
+@serialized_relay_change
+def relay_turn_off(*, operation: str = "mag relay off") -> int:
     """中継を OFF にし、Claude Code の設定を元に戻す。"""
-    if not relay_enabled() and not relay_settings_installed():
+    enabled = relay_enabled()
+    if not enabled and not relay_settings_installed():
         print(T("relay is already off", "中継はすでに OFF です"))
         return 0
+    selected = get_current("claude") if enabled else None
+    manual = selected and manually_selected(selected)
     try:
         relay_settings_apply(False)
     except (RuntimeError, OSError) as e:
+        relay_audit("claude", operation, "restore_client_settings", type(e).__name__)
         print(T(f"✗ could not update Claude Code settings: {e}", f"✗ Claude Code の設定を更新できません: {e}"),
               file=sys.stderr)
         return 1
     set_relay_enabled(False)
-    main = main_slug("claude")
-    if main:
-        set_current("claude", main)      # 本体のログイン＝メインが、そのまま使う枠になる
+    relay_audit("claude", operation, "disable", "ok")
+    relay_stop_if_unused("claude", operation)
+    selection_restored = True
+    if selected and selected != main_slug("claude"):
+        try:
+            selection_restored = do_load(selected, "manual" if manual else "relay off")
+        except (Limited, OSError, RuntimeError):
+            selection_restored = False
+    if not selection_restored or not selected or selected == main_slug("claude"):
+        reconcile_current()
     print(T("✓ relay off. Restart open Claude Code sessions so they stop using the relay.",
             "✓ 中継 OFF。開いている Claude Code のセッションは再起動してください。"))
     print(T("  Switching goes back to replacing the Claude Code login. `mag relay on` turns it back on.",
             "  以後の切り替えは、これまで通り Claude Code のログインを入れ替えます。戻すときは `mag relay on`。"))
+    if not selection_restored:
+        print(T(f"✗ Relay is off, but Claude Code could not switch to {label_of(selected)}.",
+                f"✗ 中継を解除しましたが、Claude Code を {label_of(selected)} に切り替えられませんでした。"),
+              file=sys.stderr)
+        return 1
     return 0
 
 
@@ -2803,9 +2864,8 @@ def record_limits(slug: str, data: dict) -> None:
     Codex は「今装填している弾」の分しか記録が残らないので、切り替える前に
     控えておかないと他の弾の残量を二度と表示できなくなる。
     """
-    s = state()
-    s.setdefault("limits", {})[slug] = {**data, "ts": data.get("ts") or now()}
-    save_state(s)
+    with edit_state() as s:
+        s.setdefault("limits", {})[slug] = {**data, "ts": data.get("ts") or now()}
 
 
 def known_limits(slug: str) -> dict | None:
@@ -3030,6 +3090,7 @@ def resolve_account(needle: str) -> tuple[dict | None, str]:
     return None, T(f"'{needle}' matches several: {names}", f"'{needle}' が複数に一致します: {names}")
 
 
+@serialized_relay_change
 def cmd_load(args) -> int:
     acct, _ = resolve_account(args.alias)
     lock = codex_auth_lock() if acct and provider_of(acct) == "codex" else contextlib.nullcontext()
@@ -3043,12 +3104,19 @@ def _cmd_load(args) -> int:
         print(f"✗ {err}", file=sys.stderr)
         return 1
     prov = provider_of(acct)
+    if not relay_prepare_switch(prov, operation="mag use"):
+        return 1
     restart_codex = getattr(args, "restart_codex", False)
     if restart_codex and prov != "codex":
         print(T("✗ --restart-codex requires a Codex account.",
                 "✗ --restart-codex は Codex アカウントにのみ指定できます。"), file=sys.stderr)
         return 1
     already_active = get_current(prov) == acct["slug"]
+    if prov == "claude" and already_active and not relay_enabled():
+        live = current_oauth() or {}
+        stored = stored_oauth(acct["slug"]) or {}
+        already_active = bool(live.get("refreshToken") and
+                              live.get("refreshToken") == stored.get("refreshToken"))
     if prov == "codex" and already_active:
         # State can lag a manual login. Confirm the disk account before
         # treating a selection as already active.
@@ -3587,16 +3655,15 @@ def already_warmed(target: str) -> bool:
 
 
 def mark_warmed(target: str, ok: bool, msg: str) -> None:
-    s = state()
-    warm = s.setdefault("warm", {})
-    warm[target] = {
-        "at": now(), "ok": ok, "msg": msg, "for_since": s.get("last_switch", 0),
-    }
-    # 外した弾の検証結果が残ると、doctor に出ない名前の NG が並んで紛らわしい
-    known = {a["slug"] for a in accounts()}
-    for slug in [k for k in warm if k not in known]:
-        del warm[slug]
-    save_state(s)
+    with edit_state() as s:
+        warm = s.setdefault("warm", {})
+        warm[target] = {
+            "at": now(), "ok": ok, "msg": msg, "for_since": s.get("last_switch", 0),
+        }
+        # 外した弾の検証結果が残ると、doctor に出ない名前の NG が並んで紛らわしい
+        known = {a["slug"] for a in accounts()}
+        for slug in [k for k in warm if k not in known]:
+            del warm[slug]
 
 
 def warm_account(slug: str) -> tuple[bool, str]:
@@ -3654,7 +3721,9 @@ def hotswap(kind: str, reason: str, resets_at=None) -> bool:
         log(f"hotswap: 全弾切れ ({reason})")
         notify("🔫 claude-magazine", f"全弾切れ。最短復帰 {fmt_when(when)}")
         return False
-    do_load(slug, f"hotswap: {reason}")
+    if not do_load(slug, f"hotswap: {reason}"):
+        log(f"hotswap failed: {cur} → {slug} ({reason})")
+        return False
     label = (find_account(slug) or {}).get("label", slug)
     log(f"hotswap: {cur} → {slug} ({reason})")
     notify("🔫 claude-magazine", f"{reason} → {label} に装填しました（セッションはそのまま継続）")
@@ -4019,6 +4088,29 @@ def _relay_close(sock) -> None:
         sock.close()
 
 
+def _relay_health_id(prov: str) -> bytes:
+    root = hashlib.sha256(os.path.realpath(ROOT).encode()).hexdigest()[:16]
+    return f"X-Magazine-Relay: {prov}/{root}".encode()
+
+
+def _relay_health_reply(client, head: bytes, prov: str) -> bool:
+    if head.split(b"\r\n", 1)[0] != b"GET /_magazine/health HTTP/1.1":
+        return False
+    client.sendall(b"HTTP/1.1 200 OK\r\n" + _relay_health_id(prov) +
+                   b"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+    return True
+
+
+def _relay_is_listening(port: int, prov: str, timeout: float) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout) as client:
+            client.sendall(b"GET /_magazine/health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            head, _rest = _recv_head(client, b"")
+            return bool(head and _relay_health_id(prov) in head.split(b"\r\n"))
+    except (OSError, ValueError):
+        return False
+
+
 class RelayServer:
     # Two sockets per tunnel: leave room under a 256-FD limit for the watcher,
     # credential helpers and the listening socket (64 * 2 = 128 descriptors).
@@ -4104,6 +4196,8 @@ class RelayServer:
             head, rest = _recv_head(client, b"")
             if not head:
                 return
+            if _relay_health_reply(client, head, "claude"):
+                return
             parts = head.split(b"\r\n", 1)[0].decode("latin-1").split(" ")
             if len(parts) < 2 or parts[0] != "CONNECT":
                 client.sendall(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
@@ -4172,6 +4266,9 @@ def relay_supervise() -> None:
             if srv:
                 srv.stop()
                 _RELAY_SERVERS.pop(prov, None)
+            listening = relay_listening if prov == "claude" else codex_relay_listening
+            if listening(0.2):
+                continue
             try:
                 srv = make()
                 srv.start()
@@ -4186,12 +4283,269 @@ def relay_supervise() -> None:
             log(f"relay({prov}): 停止しました")
 
 
-def relay_listening(timeout: float = 1.0) -> bool:
+RELAY_SERVICE_LABEL = "com.magazine.relay"
+RELAY_SERVICE_UNIT = "magazine-relay.service"
+RELAY_START_WAIT = 10.0         # サービスを起動してから待ち受けを待つ秒数
+RELAY_SERVICE_ENV = ("MAGAZINE_HOME", "MAGAZINE_LANG", "CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+                     "CODEX_HOME", "LANG", "LC_ALL")
+
+
+def relay_audit(prov: str, operation: str, step: str, result: str) -> None:
+    # Operation and result are fixed labels, exit codes or exception classes.
+    # Raw commands, settings and exception messages can contain credentials.
+    with contextlib.suppress(OSError):
+        log(f"relay audit: provider={prov} operation={operation!r} step={step} result={result} pid={os.getpid()}")
+
+
+def _relay_service_cmd() -> list:
+    return [sys.executable, os.path.realpath(__file__), "relay", "serve"]
+
+
+def _relay_service_env() -> dict:
+    return {k: os.environ[k] for k in RELAY_SERVICE_ENV if os.environ.get(k)}
+
+
+def _relay_launchd_path() -> str:
+    return os.path.expanduser(f"~/Library/LaunchAgents/{RELAY_SERVICE_LABEL}.plist")
+
+
+def _relay_systemd_path() -> str:
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "systemd", "user", RELAY_SERVICE_UNIT)
+
+
+def _relay_launchd_plist() -> bytes:
+    import plistlib
+    log_dir = os.path.dirname(LOG_PATH)
+    body = {
+        "Label": RELAY_SERVICE_LABEL,
+        "ProgramArguments": _relay_service_cmd(),
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "ProcessType": "Background",
+        "ThrottleInterval": 5,
+        "StandardOutPath": os.path.join(log_dir, "relay.out.log"),
+        "StandardErrorPath": os.path.join(log_dir, "relay.err.log"),
+    }
+    if env := _relay_service_env():
+        body["EnvironmentVariables"] = env
+    return plistlib.dumps(body)
+
+
+def _relay_systemd_unit() -> bytes:
+    def q(s):
+        return '"' + str(s).replace("\\", "\\\\").replace('"', '\\"') + '"'
+    lines = ["[Unit]", "Description=magazine relay — keeps Claude Code / Codex signed in to the main account",
+             "", "[Service]", "Type=simple", "ExecStart=" + " ".join(q(a) for a in _relay_service_cmd()),
+             "Restart=always", "RestartSec=2"]
+    lines += [f"Environment={q(f'{k}={v}')}" for k, v in _relay_service_env().items()]
+    lines += ["", "[Install]", "WantedBy=default.target", ""]
+    return "\n".join(lines).encode()
+
+
+def _run(cmd: list, timeout: float = 15) -> subprocess.CompletedProcess:
     try:
-        with socket.create_connection(("127.0.0.1", relay_port()), timeout=timeout):
-            return True
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as e:
+        return subprocess.CompletedProcess(cmd, 127, "", str(e))
+
+
+def relay_service_kind() -> str | None:
+    """中継を常駐させられるサービス管理。無ければ None（中継は使わず、ログインの入れ替えで動く）。"""
+    if IS_WINDOWS:
+        return None
+    if IS_MAC:
+        return "launchd" if shutil.which("launchctl") else None
+    if shutil.which("systemctl") and _run(["systemctl", "--user", "show-environment"], 5).returncode == 0:
+        return "systemd"
+    return None
+
+
+def _write_if_changed(path: str, body: bytes) -> bool:
+    try:
+        with open(path, "rb") as f:
+            if f.read() == body:
+                return False
     except OSError:
-        return False
+        pass
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(body)
+        os.replace(tmp, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp)
+    return True
+
+
+def relay_service_installed() -> bool:
+    kind = relay_service_kind()
+    return bool(kind) and os.path.exists(_relay_launchd_path() if kind == "launchd" else _relay_systemd_path())
+
+
+def relay_service_start() -> str | None:
+    """中継サービスを登録して起動する（何度呼んでもよい）。失敗理由を返す。"""
+    kind = relay_service_kind()
+    if kind is None:
+        return T("this system has no launchd or systemd --user to keep the relay running",
+                 "この環境には中継を常駐させる仕組み（launchd / systemd --user）がありません")
+    if kind == "launchd":
+        path = _relay_launchd_path()
+        changed = _write_if_changed(path, _relay_launchd_plist())
+        domain = f"gui/{os.getuid()}"
+        target = f"{domain}/{RELAY_SERVICE_LABEL}"
+        loaded = _run(["launchctl", "print", target]).returncode == 0
+        if loaded and changed:
+            _run(["launchctl", "bootout", target])
+            loaded = False
+        if loaded:
+            r = _run(["launchctl", "kickstart", target])   # 動いていれば何もしない
+            return None if r.returncode == 0 else ((r.stderr or r.stdout).strip() or "launchctl kickstart failed")
+        r = None
+        for _ in range(5):          # bootout 直後は少しのあいだ bootstrap が失敗することがある
+            r = _run(["launchctl", "bootstrap", domain, path])
+            if r.returncode == 0:
+                break
+            time.sleep(0.5)
+        if r.returncode != 0 and _run(["launchctl", "print", target]).returncode != 0:
+            return (r.stderr or r.stdout).strip() or f"launchctl bootstrap: exit {r.returncode}"
+        log("relay service: launchd に登録しました")
+        return None
+    path = _relay_systemd_path()
+    if _write_if_changed(path, _relay_systemd_unit()):
+        _run(["systemctl", "--user", "daemon-reload"])
+        r = _run(["systemctl", "--user", "enable", "--now", RELAY_SERVICE_UNIT])
+        if r.returncode == 0:
+            log("relay service: systemd に登録しました")
+        r = _run(["systemctl", "--user", "restart", RELAY_SERVICE_UNIT])
+    else:
+        r = _run(["systemctl", "--user", "enable", "--now", RELAY_SERVICE_UNIT])
+    if r.returncode != 0:
+        return (r.stderr or r.stdout).strip() or f"systemctl: exit {r.returncode}"
+    return None
+
+
+def relay_service_stop(prov: str, operation: str) -> None:
+    """中継サービスを止めて登録を外す。"""
+    kind = relay_service_kind()
+    if kind == "launchd":
+        stop = _run(["launchctl", "bootout", f"gui/{os.getuid()}/{RELAY_SERVICE_LABEL}"])
+        path = _relay_launchd_path()
+    elif kind == "systemd":
+        stop = _run(["systemctl", "--user", "disable", "--now", RELAY_SERVICE_UNIT])
+        path = _relay_systemd_path()
+    else:
+        return
+    relay_audit(prov, operation, "stop_service", f"{kind}_exit_{stop.returncode}")
+    try:
+        os.remove(path)
+    except OSError as e:
+        relay_audit(prov, operation, "remove_service_registration", type(e).__name__)
+    else:
+        relay_audit(prov, operation, "remove_service_registration", "ok")
+    if kind == "systemd":
+        _run(["systemctl", "--user", "daemon-reload"])
+
+
+def relay_serve_forever() -> int:
+    """OS のサービス管理（launchd / systemd）から起動される中継の本体。
+
+    mag.py が更新されたら自分から終了し、サービス管理に新しい版で起動し直してもらう。
+    """
+    path = os.path.realpath(__file__)
+
+    def mtime():
+        try:
+            return os.stat(path).st_mtime
+        except OSError:
+            return None
+    loaded = mtime()
+    log(f"relay service: 開始 (pid {os.getpid()})")
+    try:
+        while True:
+            relay_supervise()
+            time.sleep(2)
+            if mtime() != loaded:
+                log("relay service: mag.py が更新されたので再起動します")
+                return 0
+    except KeyboardInterrupt:
+        log(f"relay service: interrupted (pid {os.getpid()})")
+        return 0
+    except Exception as e:
+        log(f"relay service: exited with {type(e).__name__} (pid {os.getpid()})")
+        raise
+    finally:
+        for srv in list(_RELAY_SERVERS.values()):
+            srv.stop()
+        _RELAY_SERVERS.clear()
+
+
+def relay_ensure_running(prov: str) -> str | None:
+    """Start the existing relay implementation before changing client settings."""
+    listening = relay_listening if prov == "claude" else codex_relay_listening
+    if listening():
+        return None
+    os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+    err = relay_service_start()
+    if err:
+        relay_audit(prov, "start relay service", "register_or_start_service", "failed")
+        return err
+    until = time.monotonic() + RELAY_START_WAIT
+    while time.monotonic() < until:
+        if listening(0.2):
+            return None
+        time.sleep(0.2)
+    relay_audit(prov, "start relay service", "listener_health_check", "timeout")
+    return T("relay did not start listening; see the relay logs",
+             "中継が待ち受けを始めませんでした。relay のログを確認してください")
+
+
+def relay_stop_if_unused(prov: str, operation: str) -> None:
+    if not relay_enabled() and not codex_relay_enabled() and relay_service_installed():
+        relay_service_stop(prov, operation)
+
+
+def relay_rollback(prov: str, operation: str) -> None:
+    apply = relay_settings_apply if prov == "claude" else codex_config_apply
+    set_enabled = set_relay_enabled if prov == "claude" else set_codex_relay_enabled
+    try:
+        apply(False)
+    except (RuntimeError, OSError) as e:
+        relay_audit(prov, operation, "restore_client_settings", type(e).__name__)
+    set_enabled(False)
+    relay_audit(prov, operation, "disable", "rollback")
+    relay_stop_if_unused(prov, operation)
+
+
+@serialized_relay_change
+def relay_prepare_switch(prov: str, *, operation: str = "account switch") -> bool:
+    enabled = relay_enabled if prov == "claude" else codex_relay_enabled
+    installed = relay_settings_installed if prov == "claude" else codex_config_installed
+    apply = relay_settings_apply if prov == "claude" else codex_config_apply
+    set_enabled = set_relay_enabled if prov == "claude" else set_codex_relay_enabled
+    if enabled() and not main_slug(prov):
+        # An orphan flag must not make `use` report a switch it never applies.
+        relay_audit(prov, operation, "verify_main_account", "missing")
+        apply(False)
+        set_enabled(False)
+        relay_audit(prov, operation, "disable", "missing_main_account")
+        reconcile_current()
+    if not enabled():
+        if installed():
+            apply(False)
+            reconcile_current()
+        return True
+    listening = relay_listening if prov == "claude" else codex_relay_listening
+    if listening() and installed():
+        return True
+    enable = relay_turn_on if prov == "claude" else codex_relay_turn_on
+    return enable(operation=f"{operation} repair") == 0
+
+
+def relay_listening(timeout: float = 1.0) -> bool:
+    return _relay_is_listening(relay_port(), "claude", timeout)
 
 
 # ── Codex の中継（利用枠だけを予備へ回す） ──
@@ -4219,9 +4573,8 @@ def codex_relay_enabled() -> bool:
 
 
 def set_codex_relay_enabled(on: bool) -> None:
-    s = state()
-    s.setdefault("relay_codex", {})["enabled"] = on
-    save_state(s)
+    with edit_state() as s:
+        s.setdefault("relay_codex", {})["enabled"] = on
 
 
 def codex_account_id(auth: dict | None) -> str | None:
@@ -4463,6 +4816,9 @@ class CodexRelayServer(RelayServer):
         upstream = conn = None
         try:
             client.settimeout(30)
+            head, rest = _recv_head(client, b"")
+            if not head or _relay_health_reply(client, head, "codex"):
+                return
             try:
                 upstream = self.connect_upstream()
             except (OSError, ssl.SSLError):
@@ -4475,7 +4831,7 @@ class CodexRelayServer(RelayServer):
                 self.conns.add(conn)
             back = threading.Thread(target=codex_back_pipe, args=(upstream, client, conn, self.auth), daemon=True)
             back.start()
-            relay_forward_requests(client, upstream, self.auth,
+            relay_forward_requests(client, upstream, self.auth, buf=head + rest,
                                    rewrite=lambda head: codex_rewrite_head(head, self.auth, conn))
             back.join(30)
         except (OSError, EOFError, ValueError, ssl.SSLError):
@@ -4491,11 +4847,7 @@ class CodexRelayServer(RelayServer):
 
 
 def codex_relay_listening(timeout: float = 1.0) -> bool:
-    try:
-        with socket.create_connection(("127.0.0.1", codex_relay_port()), timeout=timeout):
-            return True
-    except OSError:
-        return False
+    return _relay_is_listening(codex_relay_port(), "codex", timeout)
 
 
 # ── Codex の設定（config.toml の openai_base_url） ──
@@ -4594,7 +4946,8 @@ def codex_install_main_login() -> str | None:
     return None
 
 
-def codex_relay_turn_on() -> int:
+@serialized_relay_change
+def codex_relay_turn_on(*, operation: str = "mag relay on") -> int:
     """Codex の中継を ON にする（何度呼んでもよい）。`mag main` からも呼ばれる。"""
     if IS_WINDOWS:
         print(T("✗ the Codex relay is not supported on Windows yet", "✗ Codex の中継は Windows ではまだ使えません"),
@@ -4610,17 +4963,22 @@ def codex_relay_turn_on() -> int:
                 f"✗ Codex に別の接続先が設定済みです（{conflict}）。中継はこれと併用できません"), file=sys.stderr)
         return 1
     set_codex_relay_enabled(True)       # 先に立てる: ログインを入れ替えても「使う枠」は動かさない
-    err = codex_install_main_login()
-    if err:
-        set_codex_relay_enabled(False)
-        print(T(f"✗ could not sign Codex in to the main account: {err}",
-                f"✗ Codex のログインをメインにできませんでした: {err}"), file=sys.stderr)
-        return 1
+    step = "service_start"
     try:
+        err = relay_ensure_running("codex")
+        if err:
+            raise RuntimeError(err)
+        step = "main_login"
+        err = codex_install_main_login()
+        if err:
+            raise RuntimeError(err)
+        step = "apply_client_settings"
         codex_config_apply(True)
-    except OSError as e:
-        set_codex_relay_enabled(False)
-        print(T(f"✗ could not update the Codex settings: {e}", f"✗ Codex の設定を更新できません: {e}"), file=sys.stderr)
+    except (RuntimeError, OSError) as e:
+        relay_audit("codex", operation, step, type(e).__name__)
+        relay_rollback("codex", operation)
+        reconcile_current()
+        print(T(f"✗ could not enable Codex relay: {e}", f"✗ Codex の中継を有効にできません: {e}"), file=sys.stderr)
         return 1
     print(T(f"✓ Codex relay on: Codex stays signed in to {describe(find_account(main))};"
             f" usage is charged to {label_of(get_current('codex'))}",
@@ -4628,11 +4986,7 @@ def codex_relay_turn_on() -> int:
             f"利用枠は {label_of(get_current('codex'))} から使います"))
     print(T("  Remote control, Cloud tasks and plugins stay on the main account.",
             "  リモート操作・Cloud タスク・プラグインはメインに残ります。"))
-    if watch_daemon_state() != T("running", "稼働中"):
-        print(T("  ⚠ the relay runs inside `mag watch`. Start it (or enable the background service);"
-                " until then new Codex conversations cannot connect.",
-                "  ⚠ 中継は `mag watch` の中で動きます。起動してください（常駐サービス推奨）。"
-                "起動するまで新しい Codex の会話は接続できません。"))
+    print(T("  Relay is running (restarts automatically).", "  中継は稼働中です（停止時は自動再起動）。"))
     print(T("  Restart Codex (the app, open sessions and its background server) to use the relay;"
             " until then they keep using the main account's usage.",
             "  Codex（アプリ・開いているセッション・常駐サーバー）を再起動すると中継を使います。"
@@ -4640,16 +4994,20 @@ def codex_relay_turn_on() -> int:
     return 0
 
 
-def codex_relay_turn_off() -> int:
+@serialized_relay_change
+def codex_relay_turn_off(*, operation: str = "mag relay off") -> int:
     if not codex_relay_enabled() and not codex_config_installed():
         print(T("Codex relay is already off", "Codex の中継はすでに OFF です"))
         return 0
     try:
         codex_config_apply(False)
     except OSError as e:
+        relay_audit("codex", operation, "restore_client_settings", type(e).__name__)
         print(T(f"✗ could not update the Codex settings: {e}", f"✗ Codex の設定を更新できません: {e}"), file=sys.stderr)
         return 1
     set_codex_relay_enabled(False)
+    relay_audit("codex", operation, "disable", "ok")
+    relay_stop_if_unused("codex", operation)
     main = main_slug("codex")
     if main:
         set_current("codex", main)      # ログイン＝メインが、そのまま使う枠になる
@@ -4726,9 +5084,8 @@ def relay_settings_apply(enable: bool) -> None:
             changed = True
     if not changed:
         if enable:
-            s = state()
-            s.setdefault("relay", {}).setdefault("saved_env", saved)
-            save_state(s)
+            with edit_state() as s:
+                s.setdefault("relay", {}).setdefault("saved_env", saved)
         return
     if os.path.exists(path):
         backup = path + f".bak.{time.time_ns()}"
@@ -4740,13 +5097,12 @@ def relay_settings_apply(enable: bool) -> None:
         settings.pop("env", None)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     write_json(path, settings)
-    s = state()
-    r = s.setdefault("relay", {})
-    if enable:
-        r["saved_env"] = saved
-    else:
-        r.pop("saved_env", None)
-    save_state(s)
+    with edit_state() as s:
+        r = s.setdefault("relay", {})
+        if enable:
+            r["saved_env"] = saved
+        else:
+            r.pop("saved_env", None)
 
 
 def relay_settings_installed() -> bool:
@@ -4756,9 +5112,8 @@ def relay_settings_installed() -> bool:
 
 
 def set_relay_enabled(on: bool) -> None:
-    s = state()
-    s.setdefault("relay", {})["enabled"] = on
-    save_state(s)
+    with edit_state() as s:
+        s.setdefault("relay", {})["enabled"] = on
 
 
 def install_main_login() -> str | None:
@@ -4896,21 +5251,20 @@ def mark_watch_alive(started: bool = False) -> None:
     mag.py を更新しても常駐を再起動するまで古い版が動き続ける。
     後から気づけるよう、動いている版のタイムスタンプを置いておく。
     """
-    s = state()
-    w = s.get("watch") or {}
-    if not started and now() - float(w.get("at") or 0) < WATCH_HEARTBEAT:
-        return
-    path = os.path.abspath(__file__)
-    try:
-        mtime = os.stat(path).st_mtime
-    except OSError:
-        mtime = None
-    s["watch"] = {
-        "pid": os.getpid(), "at": now(), "script": path, "script_mtime": mtime,
-        "version": VERSION,
-        "started_at": now() if started else (w.get("started_at") or now()),
-    }
-    save_state(s)
+    with edit_state() as s:
+        w = s.get("watch") or {}
+        if not started and now() - float(w.get("at") or 0) < WATCH_HEARTBEAT:
+            return
+        path = os.path.abspath(__file__)
+        try:
+            mtime = os.stat(path).st_mtime
+        except OSError:
+            mtime = None
+        s["watch"] = {
+            "pid": os.getpid(), "at": now(), "script": path, "script_mtime": mtime,
+            "version": VERSION,
+            "started_at": now() if started else (w.get("started_at") or now()),
+        }
 
 
 def watch_restart_hint() -> str:
@@ -5258,12 +5612,36 @@ def maybe_check_update(cmd: str | None) -> None:
         log(f"update check: {type(e).__name__}: {e}")
 
 
+def launch_claude(argv: list[str]) -> int:
+    # Auth and maintenance commands may change the login themselves.
+    management = {"auth", "mcp", "plugin", "plugins", "install", "update", "upgrade",
+                  "doctor", "setup-token", "agents", "project", "gateway", "ultrareview"}
+    if not argv or argv[0] not in management:
+        try:
+            cmd_auto(argparse.Namespace(no_probe=True, provider="claude", verbose=False))
+        except Exception as e:
+            # Starting Claude must still work if Magazine's automatic check fails.
+            print(T(f"[magazine] Could not check the account ({type(e).__name__}); starting Claude.",
+                    f"[magazine] アカウント確認に失敗しました（{type(e).__name__}）。Claude は起動します。"),
+                  file=sys.stderr)
+    binary = find_claude_bin()
+    try:
+        os.execvp(binary, [binary, *argv])
+    except OSError as e:
+        print(T(f"✗ could not start claude: {e}", f"✗ claude を起動できません: {e}"), file=sys.stderr)
+        return 127
+
+
 def main() -> int:
     # Claude Code の中から実行されると、中継用の HTTPS_PROXY を引き継ぐ。
     # mag 自身の通信は中継に頼らない（中継が止まっていても診断できるように）。
     for key in ("HTTPS_PROXY", "https_proxy"):
         if os.environ.get(key) == relay_url():
             os.environ.pop(key)
+    if sys.argv[1:2] == ["_claude-launch"]:
+        # The wrapper's process inherits the old proxy from its parent. Exec
+        # with the cleaned environment; Claude can load current relay settings.
+        return launch_claude(sys.argv[2:])
     if sys.argv[1:] == ["_codex-restart-worker"]:
         return 0  # Retired worker invocation; never restart a provider process.
     if sys.argv[1:] == ["_codex-auth-worker"]:
@@ -5417,7 +5795,11 @@ Registering (the alias is what you type from then on):
 
     args = p.parse_args()
     try:
-        rc = args.func(args)
+        if args.func in (cmd_add, cmd_login, cmd_update, cmd_remove, cmd_rename, cmd_main):
+            with file_lock(ACCOUNTS_PATH + ".lock"):
+                rc = args.func(args)
+        else:
+            rc = args.func(args)
     except KeyboardInterrupt:
         return 130
     maybe_check_update(args.cmd)

@@ -49,7 +49,7 @@ On macOS/Linux, the Python command must be `python3`; on Windows, `python.exe`.
 Clone the tagged release so you can inspect the installer before running it:
 
 ```sh
-git clone --branch v0.1.4 --depth 1 https://github.com/shirakawayohane/magazine.git
+git clone --branch v0.1.5 --depth 1 https://github.com/shirakawayohane/magazine.git
 cd magazine
 ```
 

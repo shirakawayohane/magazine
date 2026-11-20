@@ -186,11 +186,24 @@ How it works:
   of Claude Code's `settings.json` (backed up first), and signs Claude Code in to the
   main account. `mag relay off` restores the previous values. Restart open sessions
   after either.
-- The relay listens on `127.0.0.1:47821` (`relay_port` in `config.json`) inside
-  `mag watch`, so the monitor must be running. If it is not, Claude Code cannot connect
-  and retries, and HTTPS commands Claude Code runs (`git push`, `gh`, `curl`) fail too,
-  because they inherit the proxy setting. Restarting the monitor leaves a gap of about
-  a second. `mag main clear` (or `mag relay off`) puts things back.
+- The relay listens on `127.0.0.1:47821` (`relay_port` in `config.json`). Enabling it
+  registers a separate launchd service on macOS or a systemd user service on Linux,
+  so `mag watch` is optional. The service restarts after a crash and reloads updated
+  magazine code. Client settings are applied only after the relay answers a health
+  check; a failed setup removes magazine's routing settings and reports an error.
+  Systems without either service manager report an error and keep normal login
+  switching available. `mag main clear` (or `mag relay off`) restores the previous
+  settings and removes the service when neither provider uses it.
+- Turning Claude relay off signs Claude Code in to the account whose usage was
+  selected. If its credentials cannot be installed, the command reports the
+  failure and reconciles the active account with the live login. Restart open
+  Claude Code sessions after turning the relay off. The Magazine shell wrapper
+  and `mag resume` discard an inherited Magazine proxy address when starting
+  Claude Code, which then loads the current routing settings.
+- If a relay stops, look for `relay audit:` in the log shown by `mag doctor`.
+  These entries record the provider, triggering operation, step, result and process
+  ID. They distinguish explicit shutdown from a failed setup or repair that
+  restored the previous settings.
 - To see and rewrite requests to `api.anthropic.com`, the relay uses a local certificate
   authority created with `openssl`. It is name-constrained to `api.anthropic.com`, its
   private key is deleted after signing, and only Claude Code is told to trust it.
@@ -228,8 +241,10 @@ relay sends conversation requests with that spare's credential and account ID.
   Codex reconnects and the next turn uses the new account.
 - If the spare is rejected (401/403), the relay uses the main account for 10 minutes and
   notifies you.
-- The relay listens on `127.0.0.1:47822` (`codex_relay_port`). If it is not running, new
-  Codex conversations cannot connect. `mag main clear codex` removes the line again.
+- The relay listens on `127.0.0.1:47822` (`codex_relay_port`) in the same supervised
+  service as the Claude relay. Enablement checks its health before changing
+  `config.toml`; failure removes magazine's routing line. `mag main clear codex`
+  removes the line again. An interruption can still require Codex to reconnect.
 - Not available on Windows, or when `openai_base_url` / `OPENAI_BASE_URL` is already set.
 
 ## Usage data and network access
@@ -346,7 +361,8 @@ See [SECURITY.md](../SECURITY.md) for credentials and temporary login files.
 
 ## Uninstall
 
-First remove the saved accounts with `mag remove <name>` while the command is installed.
+First run `mag main clear` while the command is installed to restore provider routing
+and remove the relay service. Then remove saved accounts with `mag remove <name>`.
 This also removes their magazine credential entries; deleting the source alone does
 not remove Keychain entries. It does not sign out the provider's active account.
 

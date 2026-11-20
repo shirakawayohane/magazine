@@ -1,6 +1,28 @@
 # Compatibility and verification
 
-Verification date: **2026-11-04**. Release: **v0.1.4** (early release).
+## v0.1.5
+
+- On macOS, a Claude Code request launched from fish succeeded with an inherited
+  address for a stopped relay. Magazine was using the selected account directly,
+  and the background usage monitor was running under launchd.
+- Regression tests distinguish explicit relay shutdown from startup or repair
+  rollback. They check the service removal result, account selection after Claude
+  relay shutdown, and that raw failure messages stay out of the new audit entries.
+
+### Relay and storage repair (2026-11-14)
+
+- On macOS, a temporary launchd service started both relay listeners and recovered
+  both after its process was terminated. The temporary service was removed afterward.
+- A real Claude CLI request through the relay used a spare credential and returned
+  `OK`, without changing the live login. A read-only Codex models request through its
+  relay returned HTTP 200. This does not verify Codex conversation switching in the
+  desktop app or shared server.
+- Regression coverage includes simultaneous JSON writers, concurrent usage updates
+  preserving account selection, failed relay setup restoring routing, orphan relay
+  flags, mismatched Claude selection/login, and distinguishing a healthy relay from
+  an unrelated HTTP listener. The offline CLI walkthrough passed.
+- Linux service definitions are covered by unit tests; live systemd and Windows
+  checks were not run for this repair.
 
 ## v0.1.4
 

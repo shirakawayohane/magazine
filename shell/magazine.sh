@@ -12,15 +12,11 @@ _magazine_py() {
 
 claude() {
   local accounts="${MAGAZINE_HOME:-$HOME/.config/magazine}/accounts.json"
-  [ -f "$accounts" ] || [ -f "$HOME/.claude-magazine/accounts.json" ] || {
+  if { [ -f "$accounts" ] || [ -f "$HOME/.claude-magazine/accounts.json" ]; } && command -v mag >/dev/null 2>&1; then
+    _magazine_py _claude-launch "$@"
+  else
     command claude "$@"; return $?
-  }
-  case "${1:-}" in
-    auth|mcp|plugin|plugins|install|update|upgrade|doctor|setup-token|agents|project|gateway|ultrareview)
-      command claude "$@"; return $? ;;
-  esac
-  _magazine_py auto --no-probe >/dev/null 2>&1
-  command claude "$@"
+  fi
 }
 
 codex() {
